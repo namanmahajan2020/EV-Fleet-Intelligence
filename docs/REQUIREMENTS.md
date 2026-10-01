@@ -15,9 +15,9 @@ Primary user: fleet manager. Other stakeholders include drivers, fleet operators
 | FR-03 | MQTT intake, keyed Kafka topics, retries, DLQ, backpressure, recovery | `services/ingestion/`; six telemetry partitions and local valid/DLQ events observed | Implemented locally; broker outage recovery not measured |
 | FR-04 | Process events into history, latest state, derived fields, alerts, and live updates | `services/stream_processor/`; live writes observed; live-stack integration suite covers Mongo/Redis | Implemented locally; latency target not measured |
 | FR-05 | Relational core, telemetry history, latest-state cache, historical batch analytics | PostgreSQL/MongoDB/Redis storage; bounded on-demand Mongo consumption aggregation with timestamp index | Partial: no scheduled/distributed warehouse pipeline |
-| FR-06 | Fleet UI, map, battery/range, charger alternatives, alerts | `apps/web/`; authenticated API and frontend build checks | Implemented locally; screenshot not captured |
+| FR-06 | Fleet-wide charge timing/placement plan plus live map, battery/range, charger alternatives, alerts | `apps/web/`; `/api/v1/fleet/charging-plan`; authenticated UI and API integration checks | Implemented locally on reporting synthetic vehicles; screenshot not captured |
 | FR-07 | SoH, temperature risk, charging observations, range baseline; compare learned model if justified | `services/stream_processor/app/domain.py`, `/battery-health`, `/range-estimate`; no labeled data/model | Partial baseline only |
-| FR-08 | Reachable compatible charger, availability, power, time, cost, score, reasons | `services/api/app/charging.py`; unit and API smoke checks | Implemented locally as bounded heuristic |
+| FR-08 | Recommend when to charge and the lowest estimated bill at a reachable compatible available station | `services/api/app/charging.py`; `/api/v1/fleet/charging-plan` and vehicle charging endpoint | Implemented locally using explicit urgency thresholds, active-session and safety-hold states, 5 km range reserve, detour energy, flat seeded tariffs, and charge efficiency; route and dynamic tariff inputs absent |
 | FR-09 | Alert creation, status lifecycle, audit, offline and charger alerts | Stream rules and API transitions/audit; no offline or charger availability detector | Partial |
 | FR-10 | Versioned secure, paginated APIs and live dashboard data | FastAPI `/api/v1`, bearer tokens, React polling | Partial; SSE/WebSocket absent |
 | FR-11 | JWT, RBAC, fleet authorization, rate limit, secure config, audit | `services/api/app/security.py`, `main.py`, `SECURITY.md`; auth and 401 smoke | Partial; tenant row enforcement/OIDC/TLS absent |
@@ -34,7 +34,7 @@ Primary user: fleet manager. Other stakeholders include drivers, fleet operators
 | Horizontal scaling and cloud portability | Compose runs locally; no cloud manifests, IaC, or scale test. |
 | Historical batch, hot/warm/cold tiers and capacity | Bounded 30-day on-demand Mongo aggregation exists; hot/warm/cold costed tiers are absent. |
 | Three PostgreSQL query plans and optimization | Captured in `docs/SQL_OPTIMIZATION.md`; one measured index improvement, two plans unchanged. |
-| Core code coverage â‰¥80% | 48 unit and 6 integration checks pass; selected five modules 85% line coverage, but ingestion topics are 27%; branch coverage is unmeasured and aggregate is not 80% across all core services. The unit-test command writes an ignored local XML report to `docs/evidence/coverage.xml`. |
+| Core code coverage â‰¥80% | 50 unit and 7 integration checks pass; selected five modules 88% line coverage, but ingestion topics are 27%; branch coverage is unmeasured and aggregate is not 80% across all core services. The unit-test command writes an ignored local XML report to `docs/evidence/coverage.xml`. |
 
 ## Template traceability
 

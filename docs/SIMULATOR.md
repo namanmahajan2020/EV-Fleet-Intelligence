@@ -4,11 +4,11 @@ The simulator maintains state for a configurable number of synthetic vehicles an
 
 ## Local development defaults
 
-`docker compose up --build -d` runs `DEMO_MODE`, 1,000 simulator vehicle states, and a target base rate of 20 event-generation ticks/second. PostgreSQL separately seeds 100,000 synthetic vehicle registry rows. Neither number is a throughput benchmark. The publisher uses an in-memory state table and a deliberately low default rate.
+`docker compose up --build -d` runs `DEMO_MODE` across 100,000 simulator vehicle states at a target base rate of 20 event-generation ticks/second. It visits each synthetic vehicle in round-robin order; at the default rate, one complete fleet pass takes about 83 minutes. This is enough to exercise a 100K vehicle population, not the 100K events/second challenge throughput target. The publisher uses an in-memory state table, so 100K mode needs more memory than a small local smoke run.
 
 ## Configure 100K simulator vehicles
 
-Copy `.env.example` to `.env`, then set:
+Copy `.env.example` to `.env`; the default is already set to 100K synthetic states. For an explicit configuration, use:
 
 ```dotenv
 SIMULATOR_MODE=DEMO_MODE

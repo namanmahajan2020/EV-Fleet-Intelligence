@@ -134,16 +134,17 @@ This local deployment has one host, one instance per service, development creden
 
 ```mermaid
 flowchart TD
-  A[Authenticated vehicle selection] --> B[Read latest Redis state]
-  B --> C[Read vehicle connector, onboard power, capacity]
-  C --> D[Load active station connector records]
-  D --> E[Filter connector compatibility and available ports]
-  E --> F[Haversine distance from current location]
-  F --> G{Within reported range?}
+  A[Validated telemetry event] --> B[Advance Redis latest state and charge-priority index atomically]
+  B --> C[API selects charge-priority vehicles]
+  C --> D[Read vehicle connector, onboard power, capacity]
+  D --> E[Load active station connector records]
+  E --> F[Filter connector compatibility, ports, and 5 km range reserve]
+  F --> G{Reachable?}
   G -- no --> H[Discard candidate]
   G -- yes --> I[Estimate energy, time, and cost]
-  I --> J[Rank: 70% normalized distance + 30% normalized price]
-  J --> K[Return recommendation and alternatives with reasons]
+  I --> J[Estimate drive energy + target charge energy and flat-tariff bill]
+  J --> K[Sort by bill, then distance and charge time]
+  K --> L[Show urgency, cheapest station, alternatives, health and range]
 ```
 
 ## Battery and range baseline flow (no trained ML model)

@@ -57,7 +57,7 @@ class Config:
         return cls(
             mode=mode,
             seed=int(os.getenv("SIMULATOR_SEED", "20260930")),
-            vehicle_count=int(os.getenv("SIMULATOR_VEHICLE_COUNT", "1000")),
+            vehicle_count=int(os.getenv("SIMULATOR_VEHICLE_COUNT", "100000")),
             events_per_second=float(os.getenv("SIMULATOR_EVENTS_PER_SECOND", "20")),
             duplicate_rate=env_float("SIMULATOR_DUPLICATE_RATE", 0.01),
             out_of_order_rate=env_float("SIMULATOR_OUT_OF_ORDER_RATE", 0.02),
@@ -129,6 +129,7 @@ def main() -> None:
     started = time.monotonic()
     last_report = started
     next_publish = started
+    vehicle_cursor = 0
     published = duplicates = malformed = 0
     burst_logged = False
 
@@ -149,7 +150,8 @@ def main() -> None:
             elif not burst_on:
                 burst_logged = False
 
-            event = generator.next_event(interval_seconds=config.vehicle_count / current_rate)
+            event = generator.next_event(vehicle_index=vehicle_cursor, interval_seconds=config.vehicle_count / current_rate)
+            vehicle_cursor = (vehicle_cursor + 1) % config.vehicle_count
             if rng.random() < config.out_of_order_rate and recent:
                 previous = recent.popleft()
                 recent.append(event)

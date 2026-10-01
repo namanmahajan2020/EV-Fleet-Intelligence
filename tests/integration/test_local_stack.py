@@ -52,6 +52,7 @@ def test_mongodb_history_and_redis_latest_state() -> None:
     redis = Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
     state = retry(lambda: redis.hget("vehicle:latest:EV-000001", "payload"), "Redis latest vehicle state")
     assert json.loads(state)["vehicle_id"] == "EV-000001"
+    assert redis.zscore("fleet:charging:priority", "EV-000001") is not None
 
 
 def test_kafka_telemetry_topic_exists() -> None:
@@ -81,7 +82,7 @@ def test_authenticated_api_and_unauthenticated_rejection() -> None:
     request = Request(f"{API}/api/v1/charging-stations?limit=50", headers={"Authorization": f"Bearer {token}"})
     with urlopen(request, timeout=5) as response:
         stations = json.load(response)["items"]
-        assert stations
+        assert len(stations) >= 15
         assert {"station_code", "connector_type", "available_ports"}.issubset(stations[0])
     try:
         urlopen(f"{API}/api/v1/fleet/summary", timeout=5)
@@ -108,6 +109,35 @@ def test_authenticated_api_and_unauthenticated_rejection() -> None:
     finally:
         with psycopg.connect(DATABASE_URL) as conn:
             conn.execute("UPDATE users SET is_active = true WHERE email = %s", (credentials["email"],))
+
+
+def test_fleet_charge_plan_and_vehicle_insights() -> None:
+    credentials = {"email": os.environ["DEMO_OPERATOR_EMAIL"], "password": os.environ["DEMO_OPERATOR_PASSWORD"]}
+    login = Request(f"{API}/api/v1/auth/token", data=json.dumps(credentials).encode(), headers={"Content-Type": "application/json"}, method="POST")
+    with urlopen(login, timeout=5) as response:
+        token = json.load(response)["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    with urlopen(Request(f"{API}/api/v1/fleet/charging-plan?limit=25&target_soc_pct=80", headers=headers), timeout=15) as response:
+        plan = json.load(response)
+    assert 0 < plan["count"] <= 25
+    assert plan["method"] == "state_thresholds_then_lowest_estimated_energy_bill"
+    assert {item["charge_timing"] for item in plan["items"]}.issubset({"charge_now", "plan_soon", "service_review", "charging", "monitor"})
+    for item in plan["items"]:
+        assert "battery_health_category" in item and "range_km" in item
+        if item["safety_hold"]:
+            assert item["best_station"] is None
+        elif item["best_station"]:
+            options = [item["best_station"], *item["alternatives"]]
+            assert options[0]["estimated_cost_inr"] <= min(option["estimated_cost_inr"] for option in options)
+
+    for endpoint in ("range-estimate", "battery-health", "charging-recommendations"):
+        with urlopen(Request(f"{API}/api/v1/vehicles/EV-000001/{endpoint}", headers=headers), timeout=10) as response:
+            insight = json.load(response)
+            assert insight["vehicle_id"] == "EV-000001"
+            if endpoint == "charging-recommendations":
+                assert "charge_timing" in insight
+                assert insight["items"] == sorted(insight["items"], key=lambda option: (option["estimated_cost_inr"], option["distance_km"], option["estimated_charge_minutes"]))
 
 
 def test_browser_cors_preflight_and_auth_error_headers() -> None:

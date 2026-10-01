@@ -27,6 +27,16 @@ STATIONS = (
     ("CHG-BLR-003", "Koramangala Charge Point", 12.9352, 77.6245, "TYPE2", 22.0, 14.0, 6),
     ("CHG-BLR-004", "Whitefield Charging Plaza", 12.9698, 77.7500, "CCS2", 90.0, 19.5, 3),
     ("CHG-BLR-005", "Jayanagar Station", 12.9250, 77.5838, "CHADEMO", 50.0, 17.0, 2),
+    ("CHG-BLR-006", "Yeshwanthpur Charge Hub", 13.0290, 77.5500, "CCS2", 50.0, 16.8, 4),
+    ("CHG-BLR-007", "Electronic City Fast Charge", 12.8450, 77.6600, "CCS2", 60.0, 17.2, 4),
+    ("CHG-BLR-008", "Hebbal North Hub", 13.0350, 77.5970, "CCS2", 75.0, 18.5, 3),
+    ("CHG-BLR-009", "Kengeri Transit Charge", 12.9160, 77.4800, "TYPE2", 22.0, 13.8, 5),
+    ("CHG-BLR-010", "Marathahalli Charge Point", 12.9590, 77.6970, "CCS2", 75.0, 18.0, 3),
+    ("CHG-BLR-011", "Banashankari Station", 12.9250, 77.5700, "CHADEMO", 50.0, 16.4, 3),
+    ("CHG-BLR-012", "Nagawara Fast Charge", 13.0430, 77.6200, "CCS2", 60.0, 18.2, 4),
+    ("CHG-BLR-013", "Vijayanagar Charge Point", 12.9700, 77.5350, "TYPE2", 22.0, 14.1, 5),
+    ("CHG-BLR-014", "Bellandur Charging Plaza", 12.9270, 77.6770, "CCS2", 90.0, 19.0, 3),
+    ("CHG-BLR-015", "HSR Layout Station", 12.9110, 77.6380, "CHADEMO", 50.0, 15.8, 3),
 )
 
 

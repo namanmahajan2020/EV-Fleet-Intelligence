@@ -17,12 +17,12 @@ This audit maps the supplied hackathon problem statement and solution template t
 | Usable web interface and live map | `apps/web/` | Typecheck/build pass; HTTP 200; authenticated API data path | Implemented locally; screenshot not captured |
 | Battery SoH, degradation rate, temperature and charging-cycle analysis | `services/stream_processor/app/domain.py`, `/api/v1/vehicles/{id}/battery-health` | Threshold rules; endpoint computes observed SoH change only with at least one hour of stored history and counts charging-state transitions in sampled events | Partial: no full-cycle inference or future-life model |
 | Range prediction using SoC, SoH, energy, speed, temperature, vehicle | `/range-estimate` endpoint | API returns energy-balance estimate and source inputs | Partial baseline; no independent test dataset/model |
-| Charger reachability, compatibility, port availability, time/cost/reasons/rank | `services/api/app/charging.py`, charging recommendation endpoint | Unit tests; authenticated endpoint returned actual seeded candidate options | Implemented locally as heuristic; live station feeds/routes not modeled |
+| Fleet charging timing and lowest cost reachable station, with battery health/range context | `services/api/app/charging.py`, `/api/v1/fleet/charging-plan`, vehicle insight endpoints | Unit tests cover cost ordering, range reserve, urgency/safety rules; integration test exercises fleet plan and vehicle range/health/recommendation APIs | Implemented locally using seeded flat tariffs; dynamic price windows, route/traffic, and actual charger availability are not modeled |
 | Alert lifecycle, audit, offline/unavailable alert types | `services/api/app/main.py`, processor, audit table | Alert creation observed; transitions audited in code | Partial: charger unavailable and vehicle offline detection not implemented; transition smoke test not executed |
 | API/stream metrics and observability | `/metrics`, Prometheus config, Grafana Compose | API metrics scrape returns 200; Prometheus target config | Partial: no consumer-lag, processor latency, tracing, or dashboard screenshot |
 | Security controls and STRIDE | `docs/SECURITY.md`, `services/api/app/security.py` | Unit/login smoke evidence and STRIDE table | Partial: TLS/mTLS, OIDC, managed secrets, encryption policy, masking/erasure, full tenant isolation absent; local rate-limit stress not tested |
-| Unit tests and 80% core coverage | `tests/unit/`, Docker test profile | 48 passed; ignored local XML report generated at `docs/evidence/coverage.xml`; 85% line coverage across selected five modules, while ingestion topic helper is 27% (branch coverage not measured) | Partial: not 80% across all core services |
-| PostgreSQL/MongoDB/Redis/Kafka integration, contract, acceptance, failure tests | `tests/integration/test_local_stack.py`, unit contract tests | Six integration checks passed against live Compose services; alert fixture cleans itself up | Partial: BDD acceptance, broker outage, database failure and chaos tests absent |
+| Unit tests and 80% core coverage | `tests/unit/`, Docker test profile | 50 passed; ignored local XML report generated at `docs/evidence/coverage.xml`; 88% line coverage across selected five modules, while ingestion topic helper is 27% (branch coverage not measured) | Partial: not 80% across all core services |
+| PostgreSQL/MongoDB/Redis/Kafka integration, contract, acceptance, failure tests | `tests/integration/test_local_stack.py`, unit contract tests | Seven integration checks passed against live Compose services; alert fixture cleans itself up | Partial: BDD acceptance, broker outage, database failure and chaos tests absent |
 | Performance target 100K events/s and 3x burst; API p95/p99; lag | `docs/PERFORMANCE.md`, `infra/load/api.js` | Local 5-RPS fleet-summary test: 60s, p95 12.61 ms, p99 13.84 ms, 0 failed requests; no 100K events/s or burst run | Partial: modest API check only; challenge throughput, end-to-end latency, and lag not measured |
 | SQL optimization with three query plans | `docs/SQL_OPTIMIZATION.md` | One actual before/after vehicle substring plan; two indexed query plans captured | Partial; single-run, no controlled benchmark |
 | C4, data flow, ER, charging/ML flow, two critical sequences and failure recovery | `docs/diagrams/architecture.md` | Mermaid diagrams in repo | Partial: no ML flow diagram because no ML model; architecture diagrams not yet rendered/screenshot |
@@ -36,7 +36,7 @@ This audit maps the supplied hackathon problem statement and solution template t
 
 ## Final local checks recorded
 
-- Unit suite: 48 passed.
+- Unit suite: 50 passed.
 - Frontend TypeScript check and production build: passed.
 - npm audit: 0 vulnerabilities at recorded run.
 - Compose configuration validation: passed after latest YAML change.

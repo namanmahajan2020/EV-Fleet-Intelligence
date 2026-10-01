@@ -1,21 +1,20 @@
 ﻿# EV Fleet Intelligence
 
-An independent hackathon prototype for fleet operators that combines synthetic EV telemetry, live fleet visibility, battery and range indicators, charging recommendations, and operational alerts. The application uses synthetic data only and is not affiliated with Motorq.
+An independent hackathon prototype for EV fleet managers. It monitors synthetic battery and range telemetry, tells operators which vehicles need charging now or soon, and ranks reachable compatible stations by estimated charging energy bill. The application uses synthetic data only and is not affiliated with Motorq.
 
 ## Problem being addressed
 
-Fleet operators need a timely view of vehicle location, battery state, likely remaining range, charging needs, and fleet-level risks. This prototype demonstrates an event-driven path from vehicle telemetry to operational dashboard data, plus bounded historical consumption analysis. It is a local demonstrator, not a production fleet-management system.
+EV fleet managers need to determine when and where each EV should charge at the lowest cost while continuously monitoring battery health and range. The dashboard combines live vehicle state, range and health signals, charging urgency, station reachability, connector fit, current flat energy prices, and estimated charge cost. It also demonstrates an event-driven telemetry path and bounded historical consumption analysis. It is a local demonstrator, not a production fleet-management system.
 
 ## Features
 
-- PostgreSQL registry seeded with 100,000 synthetic vehicles, fleet membership, roles, charging stations, and connectors.
-- Stateful configurable simulator; the Compose default runs 1,000 simulator vehicles at a target base rate of 20 generation ticks per second. Simulator count and event rate can be changed; neither the seeded registry size nor the configured target rate is a throughput benchmark.
+- PostgreSQL registry and stateful round-robin simulator configured for 100,000 synthetic vehicles. The Compose default emits 20 event-generation ticks per second, visiting each vehicle over an approximately 83-minute fleet pass. This satisfies the simulated population requirement, not the 100K events/second throughput goal.
 - MQTT telemetry intake, schema validation, Kafka topics, dead-letter handling, stream processing, MongoDB history, Redis latest vehicle state, and PostgreSQL alerts/audit.
-- Authenticated React dashboard with fleet metrics, live map, latest vehicle list, selected-vehicle battery/range insights, charging recommendations, open alerts, historical consumption, station inventory, and service readiness.
+- Authenticated dashboard with a fleet-wide charging plan, live map, battery-health and range indicators, urgency-ranked vehicle list, cheapest reachable compatible charging option, alerts, historical consumption, station inventory, and service readiness.
 - FastAPI bearer-token authentication, PBKDF2 password hashes, database-backed active membership/role checks, per-IP Redis rate limits, and audited alert status transitions.
 - Prometheus API request/latency metrics and a Grafana service.
 
-The telemetry is synthetic. Battery health is based on transparent rules and recent observations; there is no trained machine-learning model. Range is an energy-balance baseline. Charging recommendations are a deterministic heuristic over seeded station data.
+The telemetry and 15-station Bengaluru catalogue are synthetic. Battery health is based on transparent rules and recent observations; there is no trained machine-learning model. Range is an energy-balance baseline. Charging decisions use fixed urgency thresholds and current seeded flat tariffs; there is no dynamic tariff, route, traffic, reservation, or charger control integration.
 
 ## Architecture and data flow
 
@@ -39,8 +38,8 @@ flowchart LR
 
 1. The simulator emits versioned telemetry to `evfleet/telemetry/v1/{vehicle_id}` on MQTT. Simulator state restores its latest values and per-vehicle sequence numbers from Redis after restart.
 2. Ingestion validates canonical event fields, uses bounded worker queues, and publishes valid events to partitioned Kafka telemetry. Invalid records are routed to a dead-letter topic; delivery/backpressure behavior is logged.
-3. The stream processor consumes Kafka events, deduplicates and rejects stale state progression, stores telemetry history in MongoDB, advances latest vehicle state in Redis, and evaluates rule-based alerts into PostgreSQL.
-4. The API reads the appropriate stores and serves authenticated fleet/dashboard endpoints. The web app polls fleet/live/alert/station/readiness data every five seconds and loads historical analytics and selected vehicle details through the API.
+3. The stream processor consumes Kafka events, deduplicates and rejects stale state progression, stores telemetry history in MongoDB, advances latest vehicle state and a charge-priority sorted set atomically in Redis, and evaluates rule-based alerts into PostgreSQL.
+4. The API reads the charge-priority index, latest state, station prices, and vehicle specifications to return the highest-priority fleet plan and per-vehicle alternatives. The web app refreshes fleet/live/alert/station/readiness data every five seconds and loads historical analytics and selected vehicle details through the API.
 
 Architecture diagrams and decision records are in [`docs/diagrams/architecture.md`](docs/diagrams/architecture.md) and [`docs/adr/`](docs/adr/).
 
@@ -52,7 +51,7 @@ Architecture diagrams and decision records are in [`docs/diagrams/architecture.m
 | API | Python 3.12, FastAPI, Pydantic, SQLAlchemy, Alembic | Authentication, validation, business endpoints, database migrations |
 | Relational storage | PostgreSQL 16 | Users, roles, memberships, vehicle registry, station inventory, alerts, audit records |
 | Telemetry history | MongoDB 7 | Time-stamped telemetry and bounded historical aggregations |
-| Latest-state/cache | Redis 7 | Monotonic latest vehicle state, event keys, and request rate limits |
+| Latest-state/cache | Redis 7 | Monotonic latest vehicle state, charge-priority sorted set, event keys, and request rate limits |
 | Event transport | Eclipse Mosquitto MQTT 2, Apache Kafka 3.9 | Device-style telemetry intake, durable partitioned event stream, dead-letter topic |
 | Services | Simulator, ingestion worker, stream processor | Generate, validate/transport, and process telemetry |
 | Observability | Prometheus 2.55, Grafana 11.3, Prometheus Python client | API request count/latency metrics and local monitoring |
@@ -61,7 +60,7 @@ Architecture diagrams and decision records are in [`docs/diagrams/architecture.m
 
 ## Frontend and backend structure
 
-The React application is a single-page fleet overview. `apps/web/src/main.tsx` renders login, fleet metrics, the Leaflet map, vehicle list and details, charging recommendations, alert table, station inventory, and readiness checks. `apps/web/src/api.ts` centralizes token storage, bearer headers, and 401 session handling. It uses localStorage key `evfleet-token` so refresh preserves a valid one-hour token. A 401 clears the token and dashboard state and returns the user to login. There is no separate multi-page router or server-sent/WebSocket client; live dashboard sections use five-second polling.
+The React application is a single-page fleet operations view. `apps/web/src/main.tsx` renders the fleet charging plan, urgency counts, live map, vehicle health/range details, cheapest charging alternatives, alert table, station inventory, and readiness checks. Managers can change the target charge level. `apps/web/src/api.ts` centralizes token storage, bearer headers, and 401 session handling. It uses localStorage key `evfleet-token` so refresh preserves a valid one-hour token. A 401 clears the token and dashboard state and returns the user to login. There is no separate multi-page router or server-sent/WebSocket client; live dashboard sections use five-second polling.
 
 `services/api/app/main.py` defines FastAPI endpoints and protected-route middleware. `services/api/app/security.py` signs and validates HS256 bearer tokens and verifies PBKDF2 password hashes. `services/api/app/models.py`, `services/api/alembic/`, and `services/api/app/seed.py` define relational models, migrations, and idempotent data setup. `services/api/app/charging.py` contains the recommendation heuristic. Supporting services are under `services/simulator/`, `services/ingestion/`, and `services/stream_processor/`. `packages/event_schemas/` holds the canonical Pydantic and JSON Schema event contract.
 
@@ -69,7 +68,7 @@ The React application is a single-page fleet overview. `apps/web/src/main.tsx` r
 
 - **PostgreSQL:** transactional fleet/user/role/membership records, 100,000 vehicle registry rows, charger locations/connectors, alerts, and alert audit events. API startup applies Alembic migrations and runs the idempotent seed process.
 - **MongoDB:** time-series-style telemetry documents and indexes. The consumption endpoint performs an on-demand aggregation over a caller-selected period up to 30 days; there is no scheduled warehouse/batch job.
-- **Redis:** each vehicle's latest state and sequence are advanced atomically; simulator restarts restore from that state. Redis also supports event dedupe keys and API request limits.
+- **Redis:** each vehicle's latest state, sequence, and charge-priority score are advanced atomically; the score groups charge-now, service-review, plan-soon, and monitor states and sorts by remaining range. API startup backfills the index from existing states once. Simulator restarts restore vehicle states from Redis. Redis also supports event dedupe keys and API request limits.
 - **MQTT/Kafka:** Mosquitto receives telemetry, ingestion validates events and publishes valid and dead-letter topics, and the processor commits Kafka offsets after processing. The local Compose deployment is single broker/consumer instances.
 
 ## Battery, range, recommendations, and alerts
@@ -77,7 +76,8 @@ The React application is a single-page fleet overview. `apps/web/src/main.tsx` r
 - **Battery health:** explainable threshold categories from state of health, temperature, and selected battery fault codes. The detail endpoint reports recent observations, charging-state transitions, and an observed SoH change rate when history spans at least one hour. It does not predict remaining battery life or infer complete charge cycles.
 - **Machine learning:** no trained model, independent labeled dataset, model serving, or ML quality metrics are implemented. See [`docs/ML_EVALUATION.md`](docs/ML_EVALUATION.md).
 - **Range:** baseline uses current state of charge, SoH-adjusted capacity, and consumption. It does not model route, speed, grade, weather, HVAC, or charging efficiency.
-- **Smart charging:** recommendation candidates are active seeded station connectors with available ports, matching connector type, and within reported range. Ranking uses a documented distance/price heuristic; estimated charge time assumes constant power and 90% efficiency. There is no live external station feed or route service.
+- **When to charge:** a vehicle is marked **Charge now** when SoC is at most 20% or reported range is at most 35 km; **Plan the next stop** at SoC at most 40% or range at most 80 km; active sessions show **Currently charging**; other vehicles are monitored. A battery temperature of at least 60°C or selected critical battery DTCs pauses charger suggestions and requests service review. These explainable thresholds are configurable in code, not learned from fleet operations.
+- **Where and cost:** the API filters active stations by connector, available ports, straight-line reachability with a 5 km range reserve, then estimates detour energy and grid energy to the selected target SoC at 90% charging efficiency. It sorts by estimated charging energy bill, then distance and charge time. The bill uses current flat seeded INR/kWh prices; it is not a full-trip operating cost and excludes station fees, traffic, route energy uncertainty, and time-of-use pricing. No reservation or charging command is issued.
 - **Alerts:** stream rules create low-battery, low-range, battery-degradation, and high-temperature alerts. The API supports acknowledge then resolve transitions and writes audit records. Offline-vehicle and charger-unavailable detection are not implemented.
 
 ## Authentication and API
@@ -90,11 +90,12 @@ Login is `POST /api/v1/auth/token` with JSON `{"email":"...","password":"..."}`.
 | `GET /api/v1/system/health` | PostgreSQL, MongoDB, Redis readiness | Public |
 | `POST /api/v1/auth/token` | Issue bearer token | Public; requires valid credentials |
 | `GET /api/v1/fleet/summary` | Fleet and alert counts | Bearer token |
+| `GET /api/v1/fleet/charging-plan?limit=500&target_soc_pct=80` | Highest-priority reporting vehicles, fleet status counts, charge timing, safety hold, battery/range, cheapest station and alternatives; `limit` accepts 1–2000 | Bearer token |
 | `GET /api/v1/vehicles`, `GET /api/v1/vehicles/{id}` | Registry and selected vehicle | Bearer token |
 | `GET /api/v1/live-vehicles` | Latest telemetry from Redis | Bearer token |
 | `GET /api/v1/vehicles/{id}/battery-health` | Battery observations and rule status | Bearer token |
 | `GET /api/v1/vehicles/{id}/range-estimate` | Energy-balance range baseline | Bearer token |
-| `GET /api/v1/vehicles/{id}/charging-recommendations` | Reachable charging options | Bearer token |
+| `GET /api/v1/vehicles/{id}/charging-recommendations?target_soc_pct=80` | Cost-sorted reachable options, charge urgency, bill, time, and savings against cheapest | Bearer token |
 | `GET /api/v1/charging-stations` | Active seeded station connectors | Bearer token |
 | `GET /api/v1/alerts`, `PATCH /api/v1/alerts/{id}` | Alert listing and lifecycle | Bearer token |
 | `GET /api/v1/analytics/consumption` | Bounded on-demand history aggregation | Bearer token |
@@ -104,7 +105,7 @@ Interactive API documentation is at `/docs` and OpenAPI JSON at `/openapi.json`.
 
 ## Prerequisites and configuration
 
-- Docker Engine/Desktop with Docker Compose v2 and enough memory/disk for Kafka, databases, images, and the 100,000-row seed.
+- Docker Engine/Desktop with Docker Compose v2 and enough memory/disk for Kafka, databases, images, a 100,000-row seed, and 100,000 in-memory simulator states. A constrained laptop can set `SIMULATOR_VEHICLE_COUNT=1000` for a smoke run, but that is below the hackathon population target.
 - Internet access for initial container images and package downloads.
 - Optional for frontend development on the host: Node.js 22.12 or newer and npm.
 
@@ -154,7 +155,7 @@ Change simulator configuration in `.env`, then recreate only the simulator:
 docker compose up -d --force-recreate simulator
 ```
 
-To configure the simulator with 100,000 vehicle states, set `SIMULATOR_VEHICLE_COUNT=100000` in `.env` and recreate it. The normal default intentionally uses 1,000 active simulator states while the PostgreSQL registry has 100,000 vehicles. Increasing simulator size or rate raises local memory, CPU, and broker load. Read [`docs/SIMULATOR.md`](docs/SIMULATOR.md) before load mode.
+To run the required 100,000 simulator states, use the checked-in `.env.example` default (`SIMULATOR_VEHICLE_COUNT=100000`) and recreate the simulator after changing `.env`. A full pass visits each synthetic EV once; at 20 events/second, this takes about 83 minutes. For a constrained local smoke run, set `SIMULATOR_VEHICLE_COUNT=1000`, which does not meet the population target. Read [`docs/SIMULATOR.md`](docs/SIMULATOR.md) before load mode.
 
 Stop the stack and retain volumes with `docker compose down`. To also delete all local database/monitoring volumes, use `docker compose down -v` only when that data is disposable.
 
@@ -190,7 +191,7 @@ docker compose --profile load run --rm k6
 
 Configure `LOAD_DURATION`, `LOAD_RATE`, `LOAD_PREALLOCATED_VUS`, and `LOAD_MAX_VUS` in `.env`. The checked-in script exercises an authenticated API workload and has modest API latency thresholds; this is not a 100,000-events/second telemetry benchmark. A previously recorded 60-second 5-RPS fleet-summary run measured p95 12.61 ms and p99 13.84 ms on one local stack. See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for scope and evidence.
 
-Latest checks from this workspace: 48 unit tests and 6 live integration tests passed; frontend typecheck/build passed; npm audit reported zero vulnerabilities; Ruff and Compose configuration checks passed. Selected-module line coverage is 85%, not 85% across all core services. The integration and coverage details and limits are in [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
+Latest checks from this workspace: 50 unit tests and 7 live integration tests passed; frontend typecheck/build passed; Ruff and Compose configuration checks passed. Selected-module line coverage is 88%, not 88% across all core services. The integration and coverage details and limits are in [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
 
 ## Observability and retention
 

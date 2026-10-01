@@ -4,7 +4,7 @@ Submission format: export this document to PDF after team metadata, screenshots,
 
 To be submitted by: `[Team Name]`
 Team members & roles: `[Names, roles, emails]`
-Problem space: EV fleet battery visibility and charging recommendations
+Problem space: decide when and where each EV should charge at the lowest cost while monitoring battery health and range
 Repository URL: `https://github.com/namanmahajan2020/EV-Fleet-Intelligence`
 Demo video URL (â‰¤ 5 min): `Not recorded`
 Date of submission: `[DD/MM/YYYY]`
@@ -31,7 +31,7 @@ Date of submission: `[DD/MM/YYYY]`
 
 ## 1. Executive Summary
 
-This prototype helps a fleet manager inspect synthetic EV fleet state, identify battery and low-charge signals, and compare reachable compatible charging stations. Its working local path is a deterministic synthetic event stream through MQTT, schema validation, Kafka, storage and stream processing, FastAPI, and a React map/dashboard. The local seed registers 100,000 synthetic vehicles. A single local PostgreSQL query test reduced a vehicle contains-search plan from 43.465 ms sequential scan to 2.048 ms using a trigram index in one run. The latest automated unit run passed 48 tests. A 60-second API test at 5 requests/second measured p95 12.61 ms and p99 13.84 ms for the fleet-summary endpoint; this modest local run does not establish the challenge-scale throughput or end-to-end latency targets. Model accuracy and business impact have not been measured.
+This prototype helps a fleet manager decide when reporting synthetic EVs need to charge, compare reachable compatible stations by estimated bill, and monitor battery health and range. Its working local path is a deterministic 100,000-state synthetic event stream through MQTT, schema validation, Kafka, storage and stream processing, FastAPI, and a React fleet charging plan. A single local PostgreSQL query test reduced a vehicle contains-search plan from 43.465 ms sequential scan to 2.048 ms using a trigram index in one run. The latest automated unit run passed 50 tests. A 60-second API test at 5 requests/second measured p95 12.61 ms and p99 13.84 ms for the fleet-summary endpoint; this modest local run does not establish the challenge-scale throughput or end-to-end latency targets. Model accuracy and business impact have not been measured.
 
 ## 2. Problem Statement & Validation
 
@@ -71,7 +71,7 @@ The prototype combines a vehicle's current synthetic state with compatibility, r
 
 1. Vehicle-keyed durable stream with duplicate-safe sinks and monotonic Redis state: exercised by unit checks and a live local pipeline.
 2. Explainable battery categories with reason codes: computed by explicit rules, not an opaque model.
-3. Charger candidates ranked with a stated 70% distance / 30% price heuristic after range, connector, and port filtering: tested on deterministic station fixtures and smoke-called through the API.
+3. Fleet charging plan classifies charge urgency and ranks feasible station candidates by estimated charging energy bill, then distance and charge time. It includes a 5 km range reserve, travel-energy estimate, 90% charging efficiency, and a battery service hold for critical temperature/DTC signals. Unit and live API integration checks exercise the decisions.
 
 ## 4. Feature List
 
@@ -82,7 +82,7 @@ The prototype combines a vehicle's current synthetic state with compatibility, r
 | F-03 | Stream processing and polyglot persistence | As an operator, I need latest state, history, and operational alerts | Must | Done locally; recovery target not measured | `services/stream_processor/` | Not recorded |
 | F-04 | Fleet API and bearer login | As a fleet manager, I need protected fleet data | Must | Partial: single-demo-fleet scope only | `services/api/app/` | Not recorded |
 | F-05 | Map, alerts, vehicle detail | As a fleet manager, I need live operational context | Must | Done locally | `apps/web/src/main.tsx` | Not recorded |
-| F-06 | Range and charger recommendation | As a driver manager, I need reachable compatible options and estimated cost | Must | Partial: heuristic estimates, limited station data | `services/api/app/charging.py`, `services/api/app/main.py` | Not recorded |
+| F-06 | Fleet charging timing and cheapest reachable station | As a fleet manager, I need each reporting EV prioritized by charge urgency, battery health/range, and estimated charge bill | Must | Implemented locally with fixed thresholds and flat seed prices; no dynamic tariff or route feed | `services/api/app/charging.py`, `/api/v1/fleet/charging-plan`, `apps/web/src/main.tsx` | Not recorded |
 | F-07 | Battery remaining-life model | As a fleet manager, I need calibrated health predictions | Should | Planned; no labeled data/model | `docs/ML_EVALUATION.md` | â€” |
 | F-08 | 100K events/s, multi-node recovery | As an operator, I need challenge-scale service | Must | Not measured / not demonstrated | `docs/PERFORMANCE.md` | â€” |
 
@@ -138,7 +138,7 @@ REST API is versioned under `/api/v1`; OpenAPI is exposed at `/docs`. List endpo
 
 ### 6.5 Algorithms & Data Structures
 
-Charger selection uses Haversine great-circle distance, filters incompatible connectors, full stations, and chargers beyond reported range, then scores candidates as 70% normalized distance and 30% normalized price. For `n` station connector records, filtering and sort is `O(n log n)` time and `O(n)` output memory. The local seeded network has five station records; no large-network benchmark was run. Energy-balance range is `SoC Ã— SoH-adjusted usable kWh Ã· consumption Ã— 100`; it excludes route and environmental effects.
+Charger selection uses Haversine great-circle distance, filters incompatible connectors, full stations, and chargers outside reported range minus a 5 km reserve. It estimates detour energy as distance × consumption / 100, grid energy as (energy to target plus detour energy) / 0.90, and charging bill as grid energy × the current flat station price. Candidates sort by estimated bill, then distance and charging minutes. For `n` station connector records, filtering and sort is `O(n log n)` time and `O(n)` output memory. The seeded Bengaluru network has 15 synthetic station/connector records; no large-network benchmark was run. Charge timing uses explicit SoC/range thresholds, while selected high-temperature or battery fault signals create a service hold. Neither timing thresholds nor prices are adaptive. Energy-balance range is `SoC × SoH-adjusted usable kWh ÷ consumption × 100`; it excludes route and environmental effects.
 
 ## 7. Non-Functional Requirements & Performance Benchmarks
 
@@ -150,7 +150,7 @@ Local login hashes passwords with PBKDF2-HMAC-SHA256, issues one-hour HMAC signe
 
 ## 9. Test Strategy
 
-Latest test command `docker compose --profile test run --build --rm unit-tests` passed **48 unit tests**. It covers schema validation, simulator behavior, ingestion/processor rules, range arithmetic, charging ranking, password hashing, and token validation. The unit-test command writes an ignored local `docs/evidence/coverage.xml` report with **85% line coverage across five selected modules** (processor domain 100%, simulator generator 90%, charger ranking 88%, security primitives 88%, ingestion topic helper 27%). Branch coverage is not measured, and this is not 80% coverage across all core services. Six live-stack integration checks passed for PostgreSQL seed/migration, MongoDB history, Redis latest state, Kafka topic metadata, authenticated analytics, and alert lifecycle/audit behavior. Frontend TypeScript checks/build pass; npm audit reported zero vulnerabilities at the time recorded. BDD acceptance, performance/soak, SAST/DAST, container scanning, erasure, and chaos/failure tests remain incomplete.
+Latest test command `docker compose --profile test run --build --rm unit-tests` passed **50 unit tests**. It covers schema validation, simulator behavior, ingestion/processor rules, range arithmetic, cost-first charger ranking, urgency/safety rules, password hashing, and token validation. The unit-test command writes an ignored local `docs/evidence/coverage.xml` report with **88% line coverage across five selected modules** (processor domain 100%, simulator generator 96%, charger logic 94%, security primitives 88%, ingestion topic helper 27%). Branch coverage is not measured, and this is not 80% coverage across all core services. Seven live-stack integration checks passed, including the fleet charge plan and vehicle range/health/recommendation endpoints. Frontend TypeScript checks/build pass. BDD acceptance, performance/soak, SAST/DAST, container scanning, erasure, and chaos/failure tests remain incomplete.
 
 ## 10. Observability
 

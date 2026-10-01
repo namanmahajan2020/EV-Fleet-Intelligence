@@ -16,6 +16,16 @@ STATIONS = (
     ("CHG-BLR-003", 12.9352, 77.6245, "TYPE2", 22.0),
     ("CHG-BLR-004", 12.9698, 77.7500, "CCS2", 90.0),
     ("CHG-BLR-005", 12.9250, 77.5838, "CHADEMO", 50.0),
+    ("CHG-BLR-006", 13.0290, 77.5500, "CCS2", 50.0),
+    ("CHG-BLR-007", 12.8450, 77.6600, "CCS2", 60.0),
+    ("CHG-BLR-008", 13.0350, 77.5970, "CCS2", 75.0),
+    ("CHG-BLR-009", 12.9160, 77.4800, "TYPE2", 22.0),
+    ("CHG-BLR-010", 12.9590, 77.6970, "CCS2", 75.0),
+    ("CHG-BLR-011", 12.9250, 77.5700, "CHADEMO", 50.0),
+    ("CHG-BLR-012", 13.0430, 77.6200, "CCS2", 60.0),
+    ("CHG-BLR-013", 12.9700, 77.5350, "TYPE2", 22.0),
+    ("CHG-BLR-014", 12.9270, 77.6770, "CCS2", 90.0),
+    ("CHG-BLR-015", 12.9110, 77.6380, "CHADEMO", 50.0),
 )
 MODELS = (("Voltara", "City", 48.0), ("Northstar", "Cargo", 76.0), ("Luma", "Touring", 82.0))
 FAULT_CODES = ("P0A80", "P0A0D", "P1A10", "U0100")
@@ -125,7 +135,9 @@ class VehicleGenerator:
         else:
             energy_used_kwh = state.energy_consumption * distance_km / 100
             state.soc_pct = max(3.0, state.soc_pct - energy_used_kwh / state.battery_capacity_kwh * 100)
-            if state.soc_pct < 24 and rng.random() < 0.04:
+            # At fleet scale each vehicle may only emit once per long simulator
+            # cycle, so a low battery needs to trigger a charging visit promptly.
+            if state.soc_pct <= 12 or (state.soc_pct < 24 and rng.random() < 0.55):
                 compatible = [station for station in STATIONS if station[3] == state.connector_type]
                 station = rng.choice(compatible or list(STATIONS))
                 state.charging = True

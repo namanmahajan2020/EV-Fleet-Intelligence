@@ -16,11 +16,11 @@ This is a planned, repeatable script, not a recording. Durations are target paci
 | 0:30â€“1:00 | Sign in and introduce the fleet overview and 100,000-vehicle registry. Clarify that registry size is not a throughput measurement. |
 | 1:00â€“1:35 | Point to the live map and reporting vehicle list. Wait for refresh if simulator data is still arriving. Select a vehicle with low SoC. |
 | 1:35â€“2:10 | Explain the current SoH and the transparent category. Open the range estimate and explain the energy-balance inputs and exclusions. |
-| 2:10â€“2:40 | Review compatible, available chargers reachable within reported range. Explain the distance/price score and the 90%-efficiency constant-power time assumption. |
+| 2:10â€“2:40 | Review the fleet charge plan: vehicles marked charge now, plan soon, monitor, or service review. Compare the lowest estimated energy bill and alternatives; explain reachability reserve and 90% charging efficiency. |
 | 2:40â€“3:00 | Show the open alert row and describe its rule trigger. Avoid resolving an alert during the presentation unless using a disposable seeded record. |
 | 3:00â€“3:45 | Show the architecture diagram and trace one event across MQTT, ingestion validation, keyed Kafka, stream processing, MongoDB/Redis/PostgreSQL, and the API. |
 | 3:45â€“4:15 | Show readiness and Prometheus API metrics. The local stack is single-node; describe the broker outage/backpressure design as implemented behavior, not as a measured recovery result. |
-| 4:15â€“5:00 | State actual evidence: 48 unit tests and six integration checks passed; a 5-RPS API check measured p95 12.61 ms / p99 13.84 ms; one local SQL search-plan comparison. State explicitly that 100K events/s, end-to-end latency SLOs, model accuracy, savings, and HA are not measured. Close with the next steps from the solution document. |
+| 4:15â€“5:00 | State actual evidence: 50 unit tests and seven integration checks passed; a 5-RPS API check measured p95 12.61 ms / p99 13.84 ms; one local SQL search-plan comparison. State explicitly that 100K events/s, end-to-end latency SLOs, model accuracy, savings, and HA are not measured. Close with the next steps from the solution document. |
 
 ## Useful commands
 

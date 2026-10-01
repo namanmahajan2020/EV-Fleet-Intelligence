@@ -1,4 +1,4 @@
-from charging import haversine_km, recommend_stations
+from charging import charging_timing, haversine_km, recommend_stations
 from ev_fleet_simulator.generator import VehicleGenerator
 from event_schemas import TelemetryEvent
 from evfleet_processor.domain import (
@@ -88,7 +88,7 @@ def test_bearer_token_rejects_unexpected_jwt_algorithm() -> None:
     assert verify_token(f"{body}.{signature}") is None
 
 
-def test_charger_recommendation_filters_and_ranks_candidates() -> None:
+def test_charger_recommendation_filters_and_minimizes_estimated_bill() -> None:
     stations = [
         {"station_code":"near", "name":"Near", "latitude":12.98, "longitude":77.60, "connector_type":"CCS2", "power_kw":60, "available_ports":2, "price_per_kwh_inr":20},
         {"station_code":"cheap", "name":"Cheap", "latitude":12.99, "longitude":77.60, "connector_type":"CCS2", "power_kw":40, "available_ports":1, "price_per_kwh_inr":10},
@@ -96,7 +96,31 @@ def test_charger_recommendation_filters_and_ranks_candidates() -> None:
         {"station_code":"full", "name":"Full", "latitude":12.98, "longitude":77.60, "connector_type":"CCS2", "power_kw":60, "available_ports":0, "price_per_kwh_inr":2},
     ]
     options = recommend_stations(latitude=12.9716, longitude=77.5946, range_km=10, connector_type="CCS2", onboard_kw=11, capacity_kwh=60, soc_pct=20, target_soc_pct=80, stations=stations)
-    assert [option["station_code"] for option in options][0] == "near"
+    assert [option["station_code"] for option in options][0] == "cheap"
     assert all(option["station_code"] in {"near", "cheap"} for option in options)
     assert options[0]["estimated_charge_minutes"] > 0
+    assert options[0]["estimated_cost_inr"] < options[1]["estimated_cost_inr"]
+    assert options[0]["estimated_grid_energy_kwh"] > options[0]["energy_to_target_kwh"]
+    assert options[0]["savings_vs_best_inr"] == 0
+    assert options[1]["savings_vs_best_inr"] > 0
     assert haversine_km(12.9716, 77.5946, 12.9716, 77.5946) == 0
+
+
+def test_charger_recommendation_preserves_range_reserve() -> None:
+    station = {"station_code": "near-limit", "name": "Near limit", "latitude": 12.98,
+               "longitude": 77.60, "connector_type": "CCS2", "power_kw": 60,
+               "available_ports": 1, "price_per_kwh_inr": 10}
+    options = recommend_stations(latitude=12.9716, longitude=77.5946, range_km=2.0,
+                                 connector_type="CCS2", onboard_kw=11, capacity_kwh=60,
+                                 soc_pct=20, target_soc_pct=80, stations=[station])
+    assert options == []
+
+
+def test_charging_timing_prioritizes_range_state_and_safety() -> None:
+    assert charging_timing(soc_pct=50, range_km=30, battery_temp_c=30, fault_codes=[])["status"] == "charge_now"
+    assert charging_timing(soc_pct=35, range_km=100, battery_temp_c=30, fault_codes=[])["status"] == "plan_soon"
+    assert charging_timing(soc_pct=70, range_km=180, battery_temp_c=30, fault_codes=[])["status"] == "monitor"
+    assert charging_timing(soc_pct=10, range_km=15, battery_temp_c=35, fault_codes=[], is_charging=True)["status"] == "charging"
+    hold = charging_timing(soc_pct=10, range_km=15, battery_temp_c=35, fault_codes=["P0A80"])
+    assert hold["status"] == "service_review"
+    assert hold["safety_hold"] is True

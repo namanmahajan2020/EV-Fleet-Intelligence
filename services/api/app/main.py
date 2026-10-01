@@ -1,5 +1,7 @@
-"""Fleet API for health, live state, stations, and alert operations."""
+"""Fleet API for health, live state, charging plans, stations, and alerts."""
 
+import logging
+from itertools import islice
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Query
@@ -9,12 +11,13 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 from pydantic import BaseModel
 from pymongo import MongoClient
 from redis import Redis
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
-from app.charging import recommend_stations
+from app.charging import charging_timing, recommend_stations
 from app.config import settings
 from app.db import SessionLocal, engine
 from app.models import User
+from app.repositories.redis_state import CHARGING_PLAN_KEY, initialize_charging_priority_index
 from app.repositories.redis_state import client as redis_client
 from app.security import issue_token, verify_password, verify_token
 
@@ -34,6 +37,12 @@ app = FastAPI(
 )
 HTTP_REQUESTS = Counter("evfleet_api_requests_total", "API requests", ["method", "path", "status"])
 HTTP_LATENCY = Histogram("evfleet_api_request_seconds", "API request latency", ["method", "path"])
+
+
+@app.on_event("startup")
+def warm_fleet_charging_index() -> None:
+    indexed = initialize_charging_priority_index()
+    logging.getLogger("evfleet.api").info("Fleet charge priority index ready vehicles=%s", indexed)
 
 
 @app.middleware("http")
@@ -352,6 +361,123 @@ def charging_stations(limit: int = Query(100, ge=1, le=500)) -> dict[str, object
     return {"items": [dict(row) for row in rows]}
 
 
+@app.get("/api/v1/fleet/charging-plan", tags=["charging"])
+def fleet_charging_plan(
+    target_soc_pct: float = Query(80, gt=0, le=100),
+    limit: int = Query(500, ge=1, le=2000),
+) -> dict[str, object]:
+    """Prioritize reporting vehicles and show their cheapest feasible charge stop."""
+    import json
+
+    ranked_ids = redis_client.zrange(CHARGING_PLAN_KEY, 0, limit - 1)
+    if ranked_ids:
+        pipeline = redis_client.pipeline(transaction=False)
+        for vehicle_id in ranked_ids:
+            pipeline.hget(f"vehicle:latest:{vehicle_id}", "payload")
+        raw_payloads = pipeline.execute()
+    else:
+        # Supports existing local Redis volumes until each vehicle emits a new event
+        # and receives an entry in the priority index.
+        keys = list(islice(redis_client.scan_iter(match="vehicle:latest:*", count=500), limit))
+        pipeline = redis_client.pipeline(transaction=False)
+        for key in keys:
+            pipeline.hget(key, "payload")
+        raw_payloads = pipeline.execute()
+        ranked_ids = [key.removeprefix("vehicle:latest:") for key in keys]
+    payloads: list[dict[str, object]] = []
+    for payload in raw_payloads:
+        if payload:
+            try:
+                payloads.append(json.loads(payload))
+            except (TypeError, json.JSONDecodeError):
+                continue
+    if not payloads:
+        return {
+            "items": [], "count": 0, "reporting_vehicle_count": int(redis_client.zcard(CHARGING_PLAN_KEY)),
+            "truncated": False, "target_soc_pct": target_soc_pct,
+            "status_counts": {"charge_now": 0, "plan_soon": 0, "service_review": 0, "charging": 0, "monitor": 0},
+            "limitations": "No vehicles are currently reporting live telemetry.",
+        }
+
+    vehicle_ids = [str(state["vehicle_id"]) for state in payloads]
+    vehicle_query = text("""
+        SELECT vehicle_id, connector_type, onboard_charging_kw, battery_capacity_kwh
+        FROM vehicles WHERE vehicle_id IN :vehicle_ids
+    """).bindparams(bindparam("vehicle_ids", expanding=True))
+    with engine.connect() as connection:
+        vehicles = connection.execute(vehicle_query, {"vehicle_ids": vehicle_ids}).mappings().all()
+        station_rows = connection.execute(text("""
+            SELECT s.station_code, s.name, s.latitude, s.longitude, c.connector_type,
+                   c.power_kw, c.available_ports, c.price_per_kwh_inr
+            FROM charging_stations s JOIN station_connectors c ON c.station_id = s.id
+            WHERE s.is_active AND c.available_ports > 0
+        """)).mappings().all()
+    vehicle_by_id = {str(vehicle["vehicle_id"]): dict(vehicle) for vehicle in vehicles}
+    stations = [dict(row) for row in station_rows]
+
+    items = []
+    for state in payloads:
+        vehicle_id = str(state["vehicle_id"])
+        vehicle = vehicle_by_id.get(vehicle_id)
+        if not vehicle:
+            continue
+        action = charging_timing(
+            soc_pct=float(state["soc_pct"]), range_km=float(state["range_km"]),
+            battery_temp_c=float(state["battery_temp_c"]), fault_codes=list(state.get("fault_codes", [])),
+            is_charging=bool(state.get("charging", False)),
+        )
+        options = []
+        if not action["safety_hold"] and action["status"] != "charging":
+            options = recommend_stations(
+                latitude=float(state["latitude"]), longitude=float(state["longitude"]),
+                range_km=float(state["range_km"]), connector_type=str(vehicle["connector_type"]),
+                onboard_kw=float(vehicle["onboard_charging_kw"]),
+                capacity_kwh=float(vehicle["battery_capacity_kwh"]), soc_pct=float(state["soc_pct"]),
+                target_soc_pct=target_soc_pct, stations=stations,
+                consumption_kwh_per_100km=float(state["energy_consumption"]),
+            )
+        best = options[0] if options else None
+        items.append({
+            "vehicle_id": vehicle_id,
+            "latitude": state["latitude"], "longitude": state["longitude"],
+            "speed_kmh": state["speed_kmh"], "timestamp": state["timestamp"],
+            "soc_pct": state["soc_pct"], "soh_pct": state["soh_pct"],
+            "range_km": state["range_km"], "battery_temp_c": state["battery_temp_c"],
+            "battery_health_category": state["battery_health_category"],
+            "battery_health_reasons": state.get("battery_health_reasons", []),
+            "fault_codes": state.get("fault_codes", []),
+            "charge_timing": action["status"], "charge_timing_label": action["label"],
+            "safety_hold": action["safety_hold"],
+            "best_station": best,
+            "alternatives": options[1:4],
+        })
+    priority = {"charge_now": 0, "service_review": 1, "plan_soon": 2, "charging": 3, "monitor": 4}
+    items.sort(key=lambda item: (
+        priority[item["charge_timing"]],
+        item["best_station"]["estimated_cost_inr"] if item["best_station"] else float("inf"),
+        float(item["range_km"]),
+    ))
+    indexed_count = int(redis_client.zcard(CHARGING_PLAN_KEY))
+    status_counts = {
+        "charge_now": int(redis_client.zcount(CHARGING_PLAN_KEY, 0, "(0.1")),
+        "service_review": int(redis_client.zcount(CHARGING_PLAN_KEY, 0.5, "(0.6")),
+        "plan_soon": int(redis_client.zcount(CHARGING_PLAN_KEY, 1, "(1.1")),
+        "charging": int(redis_client.zcount(CHARGING_PLAN_KEY, 1.25, "(1.35")),
+        "monitor": int(redis_client.zcount(CHARGING_PLAN_KEY, 2, "(2.1")),
+    }
+    if indexed_count == 0:
+        for item in items:
+            status_counts[item["charge_timing"]] += 1
+    return {
+        "items": items, "count": len(items), "target_soc_pct": target_soc_pct,
+        "reporting_vehicle_count": indexed_count or len(items), "truncated": (indexed_count or len(items)) > limit,
+        "status_counts": status_counts,
+        "method": "state_thresholds_then_lowest_estimated_energy_bill",
+        "ordering": "charge urgency, then estimated bill, then remaining range",
+        "limitations": "Live flat station prices only; no time-of-use tariffs, route/traffic, reservation, or charging execution. Only vehicles reporting telemetry are included.",
+    }
+
+
 @app.get("/api/v1/vehicles/{vehicle_id}/charging-recommendations", tags=["charging"])
 def charging_recommendations(vehicle_id: str, target_soc_pct: float = Query(80, gt=0, le=100)) -> dict[str, object]:
     import json
@@ -374,8 +500,26 @@ def charging_recommendations(vehicle_id: str, target_soc_pct: float = Query(80, 
     state = json.loads(payload)
     battery = state.get("battery_health_category")
     soc = float(state["soc_pct"])
-    candidates = recommend_stations(latitude=float(state["latitude"]), longitude=float(state["longitude"]), range_km=float(state["range_km"]), connector_type=vehicle["connector_type"], onboard_kw=float(vehicle["onboard_charging_kw"]), capacity_kwh=float(vehicle["battery_capacity_kwh"]), soc_pct=soc, target_soc_pct=target_soc_pct, stations=[dict(station) for station in stations])
-    return {"vehicle_id": vehicle_id, "current_soc_pct": soc, "target_soc_pct": target_soc_pct, "battery_health_category": battery, "method": "nearest_reachable_compatible_available_station", "score_weights": {"distance": 0.7, "price": 0.3}, "items": candidates[:10]}
+    timing = charging_timing(
+        soc_pct=soc, range_km=float(state["range_km"]),
+        battery_temp_c=float(state["battery_temp_c"]), fault_codes=list(state.get("fault_codes", [])),
+        is_charging=bool(state.get("charging", False)),
+    )
+    candidates = [] if timing["safety_hold"] or timing["status"] == "charging" else recommend_stations(
+        latitude=float(state["latitude"]), longitude=float(state["longitude"]),
+        range_km=float(state["range_km"]), connector_type=vehicle["connector_type"],
+        onboard_kw=float(vehicle["onboard_charging_kw"]), capacity_kwh=float(vehicle["battery_capacity_kwh"]),
+        soc_pct=soc, target_soc_pct=target_soc_pct,
+        stations=[dict(station) for station in stations],
+        consumption_kwh_per_100km=float(state["energy_consumption"]),
+    )
+    return {
+        "vehicle_id": vehicle_id, "current_soc_pct": soc, "current_range_km": state["range_km"],
+        "target_soc_pct": target_soc_pct, "battery_health_category": battery,
+        "charge_timing": timing, "method": "lowest_estimated_energy_bill_with_reachability_and_safety_checks",
+        "items": candidates[:10],
+        "limitations": "Uses current flat station prices and straight-line distance; excludes time-of-use tariffs, traffic, station fees, and route energy uncertainty.",
+    }
 
 
 @app.get("/api/v1/vehicles/{vehicle_id}/range-estimate", tags=["vehicles"])
