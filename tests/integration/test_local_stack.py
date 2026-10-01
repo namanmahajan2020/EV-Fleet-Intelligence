@@ -139,6 +139,38 @@ def test_fleet_charge_plan_and_vehicle_insights() -> None:
                 assert "charge_timing" in insight
                 assert insight["items"] == sorted(insight["items"], key=lambda option: (option["estimated_cost_inr"], option["distance_km"], option["estimated_charge_minutes"]))
 
+    with urlopen(Request(f"{API}/api/v1/vehicles?limit=5&offset=0", headers=headers), timeout=10) as response:
+        registry = json.load(response)
+    assert registry["total"] == 100_000 and len(registry["items"]) == 5
+    assert "latest" in registry["items"][0]
+    with urlopen(Request(f"{API}/api/v1/vehicles?limit=5&state=low_battery&sort_by=soc", headers=headers), timeout=30) as response:
+        low_battery = json.load(response)
+    assert all(item["latest"]["soc_pct"] <= 20 or item["latest"]["range_km"] <= 35 for item in low_battery["items"])
+    with urlopen(Request(f"{API}/api/v1/vehicles?limit=5&state=offline&battery_health=healthy", headers=headers), timeout=30) as response:
+        offline_with_health_filter = json.load(response)
+    assert offline_with_health_filter["total"] == 0
+    with urlopen(Request(f"{API}/api/v1/vehicles/EV-000001/telemetry?period_hours=24&limit=20", headers=headers), timeout=10) as response:
+        history = json.load(response)
+    assert history["vehicle_id"] == "EV-000001" and history["count"] > 0
+    with urlopen(Request(f"{API}/api/v1/battery-health/summary", headers=headers), timeout=30) as response:
+        health = json.load(response)
+    assert health["reporting"] > 0 and health["total_fleet"] == 100_000
+    with urlopen(Request(f"{API}/api/v1/analytics/timeseries?period_hours=24", headers=headers), timeout=20) as response:
+        trend = json.load(response)
+    assert isinstance(trend["items"], list)
+    with urlopen(Request(
+        f"{API}/api/v1/predictions/range",
+        data=json.dumps({
+            "soc_pct": 60, "soh_pct": 95, "battery_temp_c": 28,
+            "energy_consumption_kwh_per_100km": 17, "speed_kmh": 35,
+            "requested_trip_km": 80, "battery_capacity_kwh": 76,
+            "onboard_charging_kw": 11, "target_soc_pct": 80,
+        }).encode(), headers={**headers, "Content-Type": "application/json"}, method="POST",
+    ), timeout=10) as response:
+        prediction = json.load(response)
+    assert prediction["method"] == "energy_balance_baseline_v1"
+    assert prediction["prediction"]["estimated_remaining_range_km"] > 0
+
 
 def test_browser_cors_preflight_and_auth_error_headers() -> None:
     for origin in ("http://localhost:5173", "http://127.0.0.1:5173"):

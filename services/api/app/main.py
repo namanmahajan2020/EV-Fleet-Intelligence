@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from redis import Redis
 from sqlalchemy import bindparam, text
@@ -29,6 +29,19 @@ class AlertStatusUpdate(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+class RangePredictionRequest(BaseModel):
+    soc_pct: float = Field(ge=0, le=100)
+    soh_pct: float = Field(gt=0, le=100)
+    battery_capacity_kwh: float = Field(gt=0, le=300)
+    energy_consumption_kwh_per_100km: float = Field(gt=0, le=200)
+    battery_temp_c: float = Field(ge=-40, le=100)
+    onboard_charging_kw: float = Field(gt=0, le=500)
+    target_soc_pct: float = Field(gt=0, le=100)
+    requested_trip_km: float = Field(ge=0, le=10000)
+    speed_kmh: float = Field(ge=0, le=250)
+    fault_codes: list[str] = Field(default_factory=list)
 
 app = FastAPI(
     title="EV-Fleet Intelligence API",
@@ -264,19 +277,186 @@ def consumption_analytics(period_hours: int = Query(24, ge=1, le=720), limit: in
     return {"period_hours": period_hours, "since": cutoff.isoformat(), "summary": summary[0] if summary else {"events": 0, "vehicle_count": 0, "avg_consumption_kwh_per_100km": None}, "highest_reporting_vehicles": top, "method": "on_demand_mongodb_aggregation", "limitations": "Bounded query over retained telemetry; not a distributed historical warehouse or long-range trend model."}
 
 
-@app.get("/api/v1/vehicles", tags=["vehicles"])
-def list_vehicles(limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0), search: str | None = None) -> dict[str, object]:
-    where = "WHERE vehicle_id ILIKE :search" if search else ""
-    params: dict[str, object] = {"limit": limit, "offset": offset}
-    if search:
-        params["search"] = f"%{search}%"
+@app.get("/api/v1/analytics/timeseries", tags=["analytics"])
+def telemetry_timeseries(period_hours: int = Query(24, ge=1, le=720)) -> dict[str, object]:
+    """Aggregate real retained samples into hourly fleet trend points."""
+    from datetime import datetime, timedelta, timezone
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=period_hours)
+    mongo = MongoClient(
+        f"mongodb://{settings.mongo_user}:{settings.mongo_password}@{settings.mongo_host}:{settings.mongo_port}/?authSource=admin",
+        serverSelectionTimeoutMS=1500,
+    )
+    try:
+        points = list(mongo["evfleet"]["telemetry"].aggregate([
+            {"$match": {"timestamp": {"$gte": cutoff}}},
+            {"$group": {
+                "_id": {"$dateTrunc": {"date": "$timestamp", "unit": "hour"}},
+                "events": {"$sum": 1}, "avg_soc_pct": {"$avg": "$soc_pct"},
+                "avg_soh_pct": {"$avg": "$soh_pct"}, "avg_battery_temp_c": {"$avg": "$battery_temp_c"},
+                "avg_consumption_kwh_per_100km": {"$avg": "$energy_consumption"},
+                "charging_events": {"$sum": {"$cond": ["$charging", 1, 0]}},
+            }}, {"$sort": {"_id": 1}}, {"$limit": 721},
+        ]))
+    finally:
+        mongo.close()
+    return {
+        "period_hours": period_hours,
+        "items": [{"timestamp": point["_id"].isoformat(), **{key: round(float(value), 2) if key != "events" and key != "charging_events" else int(value) for key, value in point.items() if key != "_id"}} for point in points],
+        "method": "hourly_mongodb_telemetry_aggregation",
+        "limitations": "Trends reflect retained simulator telemetry only; sparse early periods may have no samples.",
+    }
+
+
+@app.get("/api/v1/battery-health/summary", tags=["battery"])
+def fleet_battery_summary() -> dict[str, object]:
+    """Summarize real current Redis states, cached briefly to avoid repeated full scans."""
+    import json
+
+    cache_key = "fleet:battery-health:summary:v1"
+    cached = redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+    total = count = healthy = watch = critical = hot = charging = low = 0
+    soh_sum = 0.0
+    keys = redis_client.scan_iter(match="vehicle:latest:*", count=500)
+    while batch := list(islice(keys, 500)):
+        pipe = redis_client.pipeline(transaction=False)
+        for key in batch:
+            pipe.hget(key, "payload")
+        for payload in pipe.execute():
+            if not payload:
+                continue
+            try:
+                state = json.loads(payload)
+                count += 1
+                soh = float(state["soh_pct"])
+                soh_sum += soh
+                category = state.get("battery_health_category")
+                healthy += category == "healthy"
+                watch += category == "watch"
+                critical += category == "critical"
+                hot += float(state["battery_temp_c"]) >= 50
+                charging += bool(state.get("charging"))
+                low += float(state["soc_pct"]) <= 20 or float(state["range_km"]) <= 35
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
     with engine.connect() as connection:
-        rows = connection.execute(text(f"""
-            SELECT vehicle_id, make, model, model_year, status, battery_capacity_kwh, connector_type
-            FROM vehicles {where} ORDER BY vehicle_id LIMIT :limit OFFSET :offset
-        """), params).mappings().all()
-        total = connection.execute(text(f"SELECT count(*) FROM vehicles {where}"), params).scalar_one()
-    return {"items": [dict(row) for row in rows], "total": total, "limit": limit, "offset": offset}
+        total = int(connection.execute(text("SELECT count(*) FROM vehicles WHERE status = 'active'")).scalar_one())
+    result = {
+        "total_fleet": total, "reporting": count, "offline": max(0, total - count),
+        "average_soh_pct": round(soh_sum / count, 2) if count else None,
+        "healthy": healthy, "watch": watch, "critical": critical, "temperature_risk": hot,
+        "charging": charging, "low_battery": low,
+        "method": "current_redis_latest_state_aggregation",
+        "limitations": "Only reporting vehicles contribute battery metrics; offline means no retained latest telemetry. No full charge-cycle counter is available.",
+    }
+    redis_client.setex(cache_key, 15, json.dumps(result))
+    return result
+
+
+@app.get("/api/v1/vehicles", tags=["vehicles"])
+def list_vehicles(
+    limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0), search: str | None = None,
+    state: str = Query("all", pattern="^(all|reporting|offline|charging|low_battery|critical)$"),
+    battery_health: str = Query("all", pattern="^(all|healthy|watch|critical)$"),
+    sort_by: str = Query("vehicle_id", pattern="^(vehicle_id|soc|range)$"),
+) -> dict[str, object]:
+    """Page the fleet registry; telemetry filters scan Redis server-side in bounded batches."""
+    import json
+
+    filtered = state != "all" or battery_health != "all"
+    if not filtered:
+        where = "WHERE vehicle_id ILIKE :search" if search else ""
+        params: dict[str, object] = {"limit": limit, "offset": offset}
+        if search:
+            params["search"] = f"%{search}%"
+        with engine.connect() as connection:
+            rows = connection.execute(text(f"""
+                SELECT vehicle_id, make, model, model_year, status, battery_capacity_kwh,
+                       connector_type, onboard_charging_kw
+                FROM vehicles {where} ORDER BY vehicle_id LIMIT :limit OFFSET :offset
+            """), params).mappings().all()
+            total = int(connection.execute(text(f"SELECT count(*) FROM vehicles {where}"), params).scalar_one())
+        items = [dict(row) for row in rows]
+        pipe = redis_client.pipeline(transaction=False)
+        for row in items:
+            pipe.hget(f"vehicle:latest:{row['vehicle_id']}", "payload")
+        for row, payload in zip(items, pipe.execute(), strict=True):
+            row["latest"] = json.loads(payload) if payload else None
+        return {"items": items, "total": total, "limit": limit, "offset": offset,
+                "filters": {"state": state, "battery_health": battery_health, "sort_by": sort_by}}
+
+    matches: list[tuple[str, dict[str, object]]] = []
+    reporting_ids: set[str] = set()
+    keys = redis_client.scan_iter(match="vehicle:latest:*", count=500)
+    while batch := list(islice(keys, 500)):
+        pipe = redis_client.pipeline(transaction=False)
+        for key in batch:
+            pipe.hget(key, "payload")
+        for key, payload in zip(batch, pipe.execute(), strict=True):
+            if not payload:
+                continue
+            vehicle_id = key.removeprefix("vehicle:latest:")
+            reporting_ids.add(vehicle_id)
+            if search and search.casefold() not in vehicle_id.casefold():
+                continue
+            try:
+                live = json.loads(payload)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            is_low = float(live["soc_pct"]) <= 20 or float(live["range_km"]) <= 35
+            if state == "offline":
+                continue
+            if state == "charging" and not live.get("charging"):
+                continue
+            if state == "low_battery" and not is_low:
+                continue
+            if state == "critical" and live.get("battery_health_category") != "critical":
+                continue
+            if battery_health != "all" and live.get("battery_health_category") != battery_health:
+                continue
+            matches.append((vehicle_id, live))
+    if state == "offline":
+        if battery_health != "all":
+            matches = []
+        else:
+            where = "WHERE status = 'active'"
+            params: dict[str, object] = {}
+            if search:
+                where += " AND vehicle_id ILIKE :search"
+                params["search"] = f"%{search}%"
+            with engine.connect() as connection:
+                registry_ids = connection.execute(text(f"SELECT vehicle_id FROM vehicles {where} ORDER BY vehicle_id"), params).scalars().all()
+            matches = [(str(vehicle_id), {}) for vehicle_id in registry_ids if str(vehicle_id) not in reporting_ids]
+    if sort_by == "soc":
+        matches.sort(key=lambda entry: float(entry[1].get("soc_pct", 101)))
+    elif sort_by == "range":
+        matches.sort(key=lambda entry: float(entry[1].get("range_km", float("inf"))))
+    else:
+        matches.sort(key=lambda entry: entry[0])
+    total = len(matches)
+    page = matches[offset:offset + limit]
+    page_ids = [vehicle_id for vehicle_id, _ in page]
+    if not page_ids:
+        rows = []
+    else:
+        query = text("""
+            SELECT vehicle_id, make, model, model_year, status, battery_capacity_kwh,
+                   connector_type, onboard_charging_kw
+            FROM vehicles WHERE vehicle_id IN :vehicle_ids
+        """).bindparams(bindparam("vehicle_ids", expanding=True))
+        with engine.connect() as connection:
+            rows = connection.execute(query, {"vehicle_ids": page_ids}).mappings().all()
+    registry = {str(row["vehicle_id"]): dict(row) for row in rows}
+    live_by_id = {vehicle_id: live for vehicle_id, live in page}
+    items = []
+    for vehicle_id in page_ids:
+        if vehicle_id in registry:
+            items.append({**registry[vehicle_id], "latest": live_by_id.get(vehicle_id) or None})
+    return {"items": items, "total": total, "limit": limit, "offset": offset,
+            "filters": {"state": state, "battery_health": battery_health, "sort_by": sort_by},
+            "method": "server_side_live_state_filter_and_pagination"}
 
 
 @app.get("/api/v1/vehicles/{vehicle_id}", tags=["vehicles"])
@@ -309,13 +489,18 @@ def live_vehicle_states(limit: int = Query(500, ge=1, le=2000)) -> dict[str, obj
 
 
 @app.get("/api/v1/alerts", tags=["alerts"])
-def list_alerts(limit: int = Query(100, ge=1, le=500), status: str | None = None) -> dict[str, object]:
-    where = "WHERE status = :status" if status else ""
+def list_alerts(limit: int = Query(100, ge=1, le=500), status: str | None = None, vehicle_id: str | None = None) -> dict[str, object]:
+    conditions = []
     params: dict[str, object] = {"limit": limit}
     if status:
         if status not in {"open", "acknowledged", "resolved"}:
             raise HTTPException(status_code=422, detail="Unsupported alert status")
         params["status"] = status
+        conditions.append("status = :status")
+    if vehicle_id:
+        params["vehicle_id"] = vehicle_id
+        conditions.append("vehicle_id = :vehicle_id")
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     with engine.connect() as connection:
         rows = connection.execute(text(f"""
             SELECT id, fleet_id, vehicle_id, alert_type, severity, message, status, created_at
@@ -541,6 +726,71 @@ def range_estimate(vehicle_id: str) -> dict[str, object]:
     usable_kwh = float(vehicle["battery_capacity_kwh"]) * soh / 100.0
     estimate_km = round((soc / 100.0) * usable_kwh * 100.0 / consumption, 1)
     return {"vehicle_id": vehicle_id, "estimated_range_km": estimate_km, "simulator_reported_range_km": state["range_km"], "inputs": {"soc_pct": soc, "soh_pct": soh, "usable_capacity_kwh": round(usable_kwh, 2), "energy_consumption_kwh_per_100km": consumption}, "method": "energy_balance_baseline_v1", "limitations": "Does not model route, speed, weather, grade, HVAC, or charge/discharge efficiency."}
+
+
+@app.get("/api/v1/vehicles/{vehicle_id}/telemetry", tags=["vehicles"])
+def vehicle_telemetry(vehicle_id: str, period_hours: int = Query(24, ge=1, le=2160), limit: int = Query(500, ge=1, le=2000)) -> dict[str, object]:
+    """Return indexed, retained historical telemetry for one vehicle."""
+    from datetime import datetime, timedelta, timezone
+
+    with engine.connect() as connection:
+        exists = connection.execute(text("SELECT 1 FROM vehicles WHERE vehicle_id = :id"), {"id": vehicle_id}).scalar_one_or_none()
+    if exists is None:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=period_hours)
+    mongo = MongoClient(
+        f"mongodb://{settings.mongo_user}:{settings.mongo_password}@{settings.mongo_host}:{settings.mongo_port}/?authSource=admin",
+        serverSelectionTimeoutMS=1500,
+    )
+    try:
+        samples = list(mongo["evfleet"]["telemetry"].find(
+            {"vehicle_id": vehicle_id, "timestamp": {"$gte": cutoff}},
+            {"_id": 0, "timestamp": 1, "soc_pct": 1, "soh_pct": 1, "battery_temp_c": 1,
+             "range_km": 1, "energy_consumption": 1, "speed_kmh": 1, "charging": 1,
+             "charging_power_kw": 1, "event_type": 1},
+        ).sort("timestamp", -1).limit(limit))
+    finally:
+        mongo.close()
+    samples.reverse()
+    for sample in samples:
+        sample["timestamp"] = sample["timestamp"].isoformat()
+    return {"vehicle_id": vehicle_id, "period_hours": period_hours, "items": samples,
+            "count": len(samples), "method": "indexed_mongodb_telemetry_history"}
+
+
+@app.post("/api/v1/predictions/range", tags=["predictions"])
+def predict_range(request: RangePredictionRequest) -> dict[str, object]:
+    """Run a transparent deterministic energy-balance estimate from supplied inputs."""
+    from app.charging import charging_timing
+
+    usable_capacity = request.battery_capacity_kwh * request.soh_pct / 100
+    estimated_range = request.soc_pct / 100 * usable_capacity * 100 / request.energy_consumption_kwh_per_100km
+    full_range = usable_capacity * 100 / request.energy_consumption_kwh_per_100km
+    timing = charging_timing(
+        soc_pct=request.soc_pct, range_km=estimated_range, battery_temp_c=request.battery_temp_c,
+        fault_codes=request.fault_codes,
+    )
+    target = max(request.soc_pct, request.target_soc_pct)
+    energy_needed = max(0.0, (target - request.soc_pct) / 100 * usable_capacity)
+    charge_minutes = energy_needed / (request.onboard_charging_kw * 0.9) * 60
+    trip_feasible = request.requested_trip_km <= estimated_range * 0.9
+    return {
+        "inputs": request.model_dump(),
+        "prediction": {
+            "estimated_remaining_range_km": round(estimated_range, 1),
+            "estimated_full_charge_range_km": round(full_range, 1),
+            "trip_with_10pct_reserve_feasible": trip_feasible,
+            "charging_required_for_trip": not trip_feasible,
+            "charge_timing": timing["status"], "charge_timing_label": timing["label"],
+            "safety_hold": timing["safety_hold"],
+            "estimated_charge_minutes_to_target": round(charge_minutes),
+            "target_soc_pct": target,
+            "battery_risk": "high" if request.soh_pct < 80 or request.battery_temp_c >= 60 else "moderate" if request.soh_pct < 90 or request.battery_temp_c >= 50 else "baseline",
+        },
+        "method": "energy_balance_baseline_v1",
+        "explanation": "Range = SoC × SoH-adjusted battery capacity ÷ consumption. Trip feasibility reserves 10% of estimated range. Charging time assumes constant onboard power and 90% efficiency.",
+        "limitations": "Deterministic estimate, not trained ML inference. Does not model route, traffic, weather, grade, HVAC, battery curve, charger availability, or charging fees.",
+    }
 
 
 @app.get("/api/v1/vehicles/{vehicle_id}/battery-health", tags=["vehicles"])

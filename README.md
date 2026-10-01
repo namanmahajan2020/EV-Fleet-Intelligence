@@ -60,7 +60,7 @@ Architecture diagrams and decision records are in [`docs/diagrams/architecture.m
 
 ## Frontend and backend structure
 
-The React application is a single-page fleet operations view. `apps/web/src/main.tsx` renders the fleet charging plan, urgency counts, live map, vehicle health/range details, cheapest charging alternatives, alert table, station inventory, and readiness checks. Managers can change the target charge level. `apps/web/src/api.ts` centralizes token storage, bearer headers, and 401 session handling. It uses localStorage key `evfleet-token` so refresh preserves a valid one-hour token. A 401 clears the token and dashboard state and returns the user to login. There is no separate multi-page router or server-sent/WebSocket client; live dashboard sections use five-second polling.
+The React application uses client-side routes for Charging Plan, Vehicles, Vehicle Details, Battery Health, Smart Charging, Charging Stations, Alerts, Analytics, Predictions, and System Health. `apps/web/src/main.tsx` provides the responsive navigation shell and API-backed route views; `apps/web/src/charts.tsx` and `apps/web/src/FleetMap.tsx` lazy-load charting and map dependencies. The vehicle registry is server-paginated with search, telemetry filters, and sort options. Dashboard live sections poll the existing APIs every five seconds; there is no SSE/WebSocket client. `apps/web/src/api.ts` centralizes token storage, bearer headers, and 401 session handling. It uses localStorage key `evfleet-token` so refresh preserves a valid one-hour token. A 401 clears the token and returns the user to login.
 
 `services/api/app/main.py` defines FastAPI endpoints and protected-route middleware. `services/api/app/security.py` signs and validates HS256 bearer tokens and verifies PBKDF2 password hashes. `services/api/app/models.py`, `services/api/alembic/`, and `services/api/app/seed.py` define relational models, migrations, and idempotent data setup. `services/api/app/charging.py` contains the recommendation heuristic. Supporting services are under `services/simulator/`, `services/ingestion/`, and `services/stream_processor/`. `packages/event_schemas/` holds the canonical Pydantic and JSON Schema event contract.
 
@@ -91,14 +91,18 @@ Login is `POST /api/v1/auth/token` with JSON `{"email":"...","password":"..."}`.
 | `POST /api/v1/auth/token` | Issue bearer token | Public; requires valid credentials |
 | `GET /api/v1/fleet/summary` | Fleet and alert counts | Bearer token |
 | `GET /api/v1/fleet/charging-plan?limit=500&target_soc_pct=80` | Highest-priority reporting vehicles, fleet status counts, charge timing, safety hold, battery/range, cheapest station and alternatives; `limit` accepts 1–2000 | Bearer token |
-| `GET /api/v1/vehicles`, `GET /api/v1/vehicles/{id}` | Registry and selected vehicle | Bearer token |
+| `GET /api/v1/vehicles`, `GET /api/v1/vehicles/{id}` | Server-paginated registry with live state, search and telemetry filters; selected vehicle | Bearer token |
 | `GET /api/v1/live-vehicles` | Latest telemetry from Redis | Bearer token |
 | `GET /api/v1/vehicles/{id}/battery-health` | Battery observations and rule status | Bearer token |
 | `GET /api/v1/vehicles/{id}/range-estimate` | Energy-balance range baseline | Bearer token |
+| `GET /api/v1/vehicles/{id}/telemetry` | Indexed retained telemetry history for charts | Bearer token |
 | `GET /api/v1/vehicles/{id}/charging-recommendations?target_soc_pct=80` | Cost-sorted reachable options, charge urgency, bill, time, and savings against cheapest | Bearer token |
 | `GET /api/v1/charging-stations` | Active seeded station connectors | Bearer token |
 | `GET /api/v1/alerts`, `PATCH /api/v1/alerts/{id}` | Alert listing and lifecycle | Bearer token |
 | `GET /api/v1/analytics/consumption` | Bounded on-demand history aggregation | Bearer token |
+| `GET /api/v1/analytics/timeseries` | Hourly retained-telemetry aggregation | Bearer token |
+| `GET /api/v1/battery-health/summary` | Cached current reporting-vehicle battery aggregation | Bearer token |
+| `POST /api/v1/predictions/range` | Deterministic range, trip, and charge-time baseline | Bearer token |
 | `GET /metrics` | Prometheus API metrics | Public on the local network |
 
 Interactive API documentation is at `/docs` and OpenAPI JSON at `/openapi.json`.
@@ -177,11 +181,12 @@ Set-Location apps/web
 npm ci
 npm run typecheck
 npm run build
+npm run test:e2e
 npm audit
 Set-Location ../..
 ```
 
-The live integration suite expects the Compose services to be available and exercises seed/migration state, MongoDB/Redis telemetry, Kafka topic, authentication, CORS, API analytics, station data, and alert lifecycle. It temporarily creates an alert fixture and cleans it up.
+The live integration suite expects the Compose services to be available and exercises seed/migration state, MongoDB/Redis telemetry, Kafka topic, authentication, CORS, API analytics, station data, vehicle filters, telemetry history, predictions, and alert lifecycle. It temporarily creates an alert fixture and cleans it up. The Playwright browser test also expects the stack to run and local `DEMO_OPERATOR_EMAIL` / `DEMO_OPERATOR_PASSWORD` values in the ignored root `.env`; it reads them in process without printing them. Install the Playwright Chromium runtime with `npx playwright install chromium`, or set `PLAYWRIGHT_CHANNEL=msedge` to use installed Microsoft Edge.
 
 A k6 API load profile is available:
 
@@ -191,7 +196,7 @@ docker compose --profile load run --rm k6
 
 Configure `LOAD_DURATION`, `LOAD_RATE`, `LOAD_PREALLOCATED_VUS`, and `LOAD_MAX_VUS` in `.env`. The checked-in script exercises an authenticated API workload and has modest API latency thresholds; this is not a 100,000-events/second telemetry benchmark. A previously recorded 60-second 5-RPS fleet-summary run measured p95 12.61 ms and p99 13.84 ms on one local stack. See [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) for scope and evidence.
 
-Latest checks from this workspace: 50 unit tests and 7 live integration tests passed; frontend typecheck/build passed; Ruff and Compose configuration checks passed. Selected-module line coverage is 88%, not 88% across all core services. The integration and coverage details and limits are in [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
+Latest checks from this workspace: 50 unit tests and 7 live integration tests passed; the Playwright navigation/interactions test passed; frontend typecheck/build passed; Ruff and Compose configuration checks passed. The browser pass covered route navigation/deep links, server-side filters, vehicle details, station selection, smart charging, predictions, chart windows, and checks for application/API 401/404/500 responses. Selected-module line coverage is 88%, not 88% across all core services. The integration and coverage details and limits are in [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
 
 ## Observability and retention
 

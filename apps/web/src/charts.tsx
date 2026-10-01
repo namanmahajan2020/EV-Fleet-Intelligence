@@ -1,0 +1,16 @@
+import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+
+type Props = { variant: 'trend' | 'vehicle' | 'consumption'; data: Record<string, any>[] };
+const timeLabel = (value: string) => new Date(value).toLocaleString();
+const tickLabel = (value: string) => new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit' });
+
+export default function Charts({ variant, data }: Props) {
+  if (variant === 'consumption') {
+    const key = data[0]?.avg_consumption_kwh_per_100km != null ? 'avg_consumption_kwh_per_100km' : 'consumption';
+    const name = key === 'consumption' ? 'kWh / 100 km' : 'kWh / 100 km';
+    const xKey = data[0]?.vehicle_id ? 'vehicle_id' : 'vehicle';
+    return <ResponsiveContainer width="100%" height="100%"><BarChart data={data}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey={xKey} angle={data.length > 10 ? -28 : 0} textAnchor={data.length > 10 ? 'end' : 'middle'} height={data.length > 10 ? 60 : 25} interval={0} hide={xKey === 'vehicle'} /><YAxis width={38} /><Tooltip /><Bar dataKey={key} name={name} fill="#4b9c7c" radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer>;
+  }
+  if (variant === 'vehicle') return <div className="split-chart"><ResponsiveContainer width="100%" height="48%"><LineChart data={data}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="timestamp" tickFormatter={(v) => new Date(v).toLocaleTimeString()} minTickGap={30} /><YAxis domain={[0, 100]} /><Tooltip labelFormatter={(v) => timeLabel(String(v))} /><Line dataKey="soc_pct" name="SoC %" stroke="#20825f" dot={false} /><Line dataKey="soh_pct" name="SoH %" stroke="#5476b6" dot={false} /></LineChart></ResponsiveContainer><ResponsiveContainer width="100%" height="48%"><LineChart data={data}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="timestamp" tickFormatter={(v) => new Date(v).toLocaleTimeString()} minTickGap={30} /><YAxis /><Tooltip labelFormatter={(v) => timeLabel(String(v))} /><Line dataKey="range_km" name="Range km" stroke="#8d62ad" dot={false} /><Line dataKey="battery_temp_c" name="Temperature °C" stroke="#d88a36" dot={false} /><Line dataKey="energy_consumption" name="Consumption kWh/100 km" stroke="#3487a4" dot={false} /></LineChart></ResponsiveContainer></div>;
+  return <div className="split-chart"><ResponsiveContainer width="100%" height="48%"><LineChart data={data}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="timestamp" tickFormatter={tickLabel} minTickGap={35} /><YAxis domain={[0, 100]} /><Tooltip labelFormatter={(v) => timeLabel(String(v))} /><Line dataKey="avg_soc_pct" name="Avg SoC %" stroke="#318c6b" dot={false} /><Line dataKey="avg_soh_pct" name="Avg SoH %" stroke="#586faf" dot={false} /></LineChart></ResponsiveContainer><ResponsiveContainer width="100%" height="48%"><LineChart data={data}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="timestamp" tickFormatter={tickLabel} minTickGap={35} /><YAxis /><Tooltip labelFormatter={(v) => timeLabel(String(v))} /><Line dataKey="avg_battery_temp_c" name="Avg battery °C" stroke="#d18439" dot={false} /><Line dataKey="avg_consumption_kwh_per_100km" name="Avg kWh/100 km" stroke="#9b69ad" dot={false} /></LineChart></ResponsiveContainer></div>;
+}

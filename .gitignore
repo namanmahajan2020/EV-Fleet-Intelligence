@@ -41,6 +41,9 @@ pip-wheel-metadata/
 node_modules/
 apps/web/dist/
 apps/web/.vite/
+apps/web/test-results/
+apps/web/playwright-report/
+apps/web/playwright/.cache/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

@@ -6,15 +6,21 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "leaflet": "^1.9.4",
+    "lucide-react": "^1.49.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-leaflet": "^4.2.1"
+    "react-is": "^19.3.0",
+    "react-leaflet": "^4.2.1",
+    "react-router-dom": "^7.18.4",
+    "recharts": "^3.10.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/leaflet": "^1.9.22",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",

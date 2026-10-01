@@ -1,232 +1,182 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { CircleMarker, MapContainer, Popup, TileLayer } from 'react-leaflet';
+import { BrowserRouter, Link, NavLink, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { Activity, AlertTriangle, Battery, Bell, Building2, CarFront, ChartNoAxesCombined, ChevronLeft, ChevronRight, CircleGauge, ClipboardList, Clock3, Gauge, HeartPulse, LayoutDashboard, LogOut, Menu, PlugZap, Search, ShieldCheck, Sparkles } from 'lucide-react';
 import { apiRequest, clearAccessToken, onSessionExpired, storeAccessToken } from './api';
 import 'leaflet/dist/leaflet.css';
 import './style.css';
 
-type Summary = { total: number; active: number; open_alerts: number; critical_alerts: number };
-type Vehicle = {
-  vehicle_id: string; latitude: number; longitude: number; soc_pct: number; soh_pct: number;
-  range_km: number; speed_kmh: number; battery_health_category: string; timestamp: string;
-};
-type ChargingOption = {
-  station_code: string; name: string; distance_km: number; estimated_charge_minutes: number;
-  estimated_cost_inr: number; estimated_grid_energy_kwh: number; price_per_kwh_inr: number;
-  savings_vs_best_inr: number; reason: string;
-};
-type ChargePlanItem = Vehicle & {
-  battery_temp_c: number; battery_health_reasons: string[]; charge_timing: string;
-  charge_timing_label: string; safety_hold: boolean; best_station: ChargingOption | null;
-  alternatives: ChargingOption[];
-};
-type ChargePlan = {
-  items: ChargePlanItem[]; count: number; target_soc_pct: number; limitations: string;
-  reporting_vehicle_count: number; truncated: boolean;
-  status_counts: { charge_now: number; plan_soon: number; service_review: number; charging: number; monitor: number };
-};
-type Alert = { id: string; vehicle_id: string; alert_type: string; severity: string; message: string; status: string; created_at: string };
-type RangeEstimate = { estimated_range_km: number; simulator_reported_range_km: number; method: string; limitations: string };
-type Analytics = { summary: { events: number; vehicle_count: number; avg_consumption_kwh_per_100km: number | null } };
-type BatteryHealth = { category: string; soh_pct: number; battery_temp_c: number; degradation_risk: string; reasons: string[] };
+type Json = Record<string, any>;
+type Vehicle = { vehicle_id: string; make: string; model: string; model_year: number; status: string; battery_capacity_kwh: number; connector_type: string; onboard_charging_kw: number; latest: Json | null };
+type PlanItem = Json & { vehicle_id: string; best_station: Json | null; alternatives: Json[] };
 type Station = { station_code: string; name: string; latitude: number; longitude: number; connector_type: string; power_kw: number; available_ports: number; price_per_kwh_inr: number };
-type SystemHealth = { status: string; postgres: string; mongodb: string; redis: string };
+type Alert = { id: string; vehicle_id: string; alert_type: string; severity: string; message: string; status: string; created_at: string };
+type ApiValue<T> = { data?: T; loading: boolean; error: string; reload: () => void };
+const ChartView = React.lazy(() => import('./charts'));
+const FleetMap = React.lazy(() => import('./FleetMap'));
+
+function useApi<T>(path: string, refreshMs = 0): ApiValue<T> {
+  const [data, setData] = useState<T>(); const [loading, setLoading] = useState(true); const [error, setError] = useState(''); const [version, setVersion] = useState(0);
+  const reload = useCallback(() => setVersion((value) => value + 1), []);
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try { const response = await apiRequest(path); if (!response.ok) throw new Error(`Request failed (${response.status})`); const value = await response.json() as T; if (live) { setData(value); setError(''); setLoading(false); } }
+      catch (reason) { if (live) { setError(reason instanceof Error ? reason.message : 'Unable to load data'); setLoading(false); } }
+    };
+    void load(); const timer = refreshMs ? window.setInterval(load, refreshMs) : undefined;
+    return () => { live = false; if (timer) window.clearInterval(timer); };
+  }, [path, refreshMs, version]);
+  return { data, loading, error, reload };
+}
+
+const navGroups = [
+  { title: 'OPERATIONS', items: [
+    { to: '/charging-plan', label: 'Charging plan', icon: LayoutDashboard },
+    { to: '/vehicles', label: 'Vehicles', icon: CarFront },
+    { to: '/battery-health', label: 'Battery health', icon: Battery },
+    { to: '/smart-charging', label: 'Smart charging', icon: PlugZap },
+    { to: '/stations', label: 'Charging stations', icon: Building2 },
+    { to: '/alerts', label: 'Alerts', icon: Bell },
+  ] },
+  { title: 'INTELLIGENCE', items: [
+    { to: '/analytics', label: 'Analytics', icon: ChartNoAxesCombined },
+    { to: '/predictions', label: 'Predictions', icon: Sparkles },
+    { to: '/system-health', label: 'System health', icon: HeartPulse },
+  ] },
+];
 
 function App() {
-  const [summary, setSummary] = useState<Summary>();
-  const [vehicles, setVehicles] = useState<Vehicle[]>([]);
-  const [chargePlan, setChargePlan] = useState<ChargePlanItem[]>([]);
-  const [planLimitations, setPlanLimitations] = useState('Waiting for fleet telemetry.');
-  const [planTotals, setPlanTotals] = useState<ChargePlan['status_counts']>();
-  const [planReportingCount, setPlanReportingCount] = useState(0);
-  const [planTruncated, setPlanTruncated] = useState(false);
-  const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [error, setError] = useState('');
-  const [selected, setSelected] = useState<Vehicle>();
-  const [token, setToken] = useState(() => window.localStorage.getItem('evfleet-token') ?? '');
-  const [loginError, setLoginError] = useState('');
+  const [token, setToken] = useState(() => localStorage.getItem('evfleet-token') ?? '');
   const [sessionExpired, setSessionExpired] = useState(false);
-  const [targetSoc, setTargetSoc] = useState(80);
-  const [rangeEstimate, setRangeEstimate] = useState<RangeEstimate>();
-  const [chargingOptions, setChargingOptions] = useState<ChargingOption[]>([]);
-  const [analytics, setAnalytics] = useState<Analytics>();
-  const [batteryHealth, setBatteryHealth] = useState<BatteryHealth>();
-  const [stations, setStations] = useState<Station[]>([]);
-  const [systemHealth, setSystemHealth] = useState<SystemHealth>();
-
-  useEffect(() => onSessionExpired(() => {
-    setToken(''); setSessionExpired(true); setSummary(undefined); setVehicles([]);
-    setChargePlan([]); setAlerts([]); setSelected(undefined); setBatteryHealth(undefined);
-    setStations([]); setSystemHealth(undefined); setAnalytics(undefined);
-    setRangeEstimate(undefined); setChargingOptions([]);
-  }), []);
-
-  useEffect(() => {
-    if (!token) return;
-    let live = true;
-    const refresh = async () => {
-      try {
-        const [s, v, p, a, st, h] = await Promise.all([
-          apiRequest('/fleet/summary'), apiRequest('/live-vehicles?limit=2000'),
-          apiRequest(`/fleet/charging-plan?limit=500&target_soc_pct=${targetSoc}`),
-          apiRequest('/alerts?limit=100&status=open'), apiRequest('/charging-stations?limit=50'),
-          apiRequest('/system/health'),
-        ]);
-        if (![s, v, p, a, st, h].every((response) => response.ok)) throw new Error('API request failed');
-        const [sd, vd, pd, ad, std, hd] = await Promise.all([s.json(), v.json(), p.json(), a.json(), st.json(), h.json()]);
-        if (live) {
-          setSummary(sd); setVehicles(vd.items); setChargePlan(pd.items);
-          setPlanLimitations(pd.limitations); setPlanTotals(pd.status_counts);
-          setPlanReportingCount(pd.reporting_vehicle_count); setPlanTruncated(pd.truncated);
-          setAlerts(ad.items); setStations(std.items);
-          setSystemHealth(hd); setError('');
-        }
-      } catch { if (live) setError('API unavailable. Confirm the local services are running.'); }
-    };
-    void refresh(); const timer = window.setInterval(refresh, 5000);
-    return () => { live = false; window.clearInterval(timer); };
-  }, [token, targetSoc]);
-
-  useEffect(() => {
-    if (!token) return;
-    apiRequest('/analytics/consumption?period_hours=24&limit=5')
-      .then((response) => response.ok ? response.json() : Promise.reject())
-      .then(setAnalytics).catch(() => setAnalytics(undefined));
-  }, [token]);
-
-  useEffect(() => {
-    if (!selected || !token) { setRangeEstimate(undefined); setChargingOptions([]); setBatteryHealth(undefined); return; }
-    const vehicleId = encodeURIComponent(selected.vehicle_id);
-    Promise.all([
-      apiRequest(`/vehicles/${vehicleId}/range-estimate`),
-      apiRequest(`/vehicles/${vehicleId}/charging-recommendations?target_soc_pct=${targetSoc}`),
-      apiRequest(`/vehicles/${vehicleId}/battery-health`),
-    ]).then(async ([r, c, b]) => {
-      if (!r.ok || !c.ok || !b.ok) throw new Error('Detail request failed');
-      return Promise.all([r.json(), c.json(), b.json()]);
-    }).then(([r, c, b]) => { setRangeEstimate(r); setChargingOptions(c.items); setBatteryHealth(b); })
-      .catch(() => { setRangeEstimate(undefined); setChargingOptions([]); setBatteryHealth(undefined); });
-  }, [selected, token, targetSoc]);
-
-  const signIn = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault(); setLoginError('');
-    const data = new FormData(event.currentTarget);
-    try {
-      const response = await apiRequest('/auth/token', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: data.get('email'), password: data.get('password') }),
-      }, true);
-      if (!response.ok) throw new Error('Sign in failed');
-      const result = await response.json() as { access_token?: string; token_type?: string };
-      if (!result.access_token || result.token_type?.toLowerCase() !== 'bearer') throw new Error('Invalid login response');
-      storeAccessToken(result.access_token); setSessionExpired(false); setToken(result.access_token);
-    } catch { setLoginError('Invalid credentials or API unavailable.'); }
-  };
-
-  const signOut = () => {
-    clearAccessToken(); setToken(''); setSummary(undefined); setVehicles([]); setChargePlan([]);
-    setAlerts([]); setSelected(undefined); setBatteryHealth(undefined); setStations([]);
-    setSystemHealth(undefined); setAnalytics(undefined); setRangeEstimate(undefined); setChargingOptions([]);
-  };
-
-  const actionCounts = useMemo(() => ({
-    now: planTotals?.charge_now ?? chargePlan.filter((item) => item.charge_timing === 'charge_now').length,
-    soon: planTotals?.plan_soon ?? chargePlan.filter((item) => item.charge_timing === 'plan_soon').length,
-    review: planTotals?.service_review ?? chargePlan.filter((item) => item.safety_hold).length,
-  }), [chargePlan, planTotals]);
-
-  if (!token) return <div className="login-screen"><form className="login-card" onSubmit={signIn}>
-    <div className="brand-icon">EV</div><p className="eyebrow">INDEPENDENT EV FLEET INTELLIGENCE</p>
-    <h1>Fleet charging, made clear</h1><p>Sign in to review charging priorities, battery health, and remaining range.</p>
-    {sessionExpired && <div className="error-banner">Your session expired. Sign in again to continue.</div>}
-    <label>Email<input name="email" type="email" required defaultValue="operator@demo.local" /></label>
-    <label>Password<input name="password" type="password" required autoComplete="current-password" /></label>
-    {loginError && <div className="error-banner">{loginError}</div>}
-    <button className="sign-in">Sign in</button><small>Use the demo operator credentials configured in your local .env file.</small>
-  </form></div>;
-
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const navigate = useNavigate();
+  useEffect(() => onSessionExpired(() => { setToken(''); setSessionExpired(true); }), []);
+  const signOut = () => { clearAccessToken(); setToken(''); navigate('/charging-plan'); };
+  if (!token) return <Login sessionExpired={sessionExpired} onLogin={(value) => { setSessionExpired(false); setToken(value); navigate('/charging-plan'); }} />;
   return <div className="app-shell">
-    <aside className="sidebar">
-      <div className="brand"><div className="brand-icon">EV</div><div><b>EV FLEET</b><small>CHARGING INTELLIGENCE</small></div></div>
-      <div className="nav-label">WORKSPACE</div>
-      <a className="nav active" href="#charging-plan">◉ <span>Charging plan</span></a>
-      <a className="nav" href="#vehicles">▤ <span>Vehicles</span></a>
-      <a className="nav" href="#alerts">⚑ <span>Alerts</span></a>
-      <a className="nav" href="#stations"><span>Charging stations</span></a>
-      <a className="nav" href="#system-health"><span>System health</span></a>
-      <div className="sidebar-bottom"><span className="online-dot" /> Live telemetry <small>Refreshes every 5 sec</small></div>
+    <aside className={`sidebar ${mobileOpen ? 'sidebar-open' : ''}`}>
+      <Link className="brand" to="/charging-plan" onClick={() => setMobileOpen(false)}><span className="brand-icon">EF</span><span><b>EV FLEET</b><small>INTELLIGENCE PLATFORM</small></span></Link>
+      {navGroups.map((group) => <div className="nav-group" key={group.title}><div className="nav-label">{group.title}</div>{group.items.map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} onClick={() => setMobileOpen(false)} className={({ isActive }) => `nav ${isActive ? 'active' : ''}`}><Icon size={17} strokeWidth={1.8} /><span>{label}</span></NavLink>)}</div>)}
+      <div className="sidebar-bottom"><span className="online-dot" /> Connected services<small>Telemetry polling · 5 sec</small></div>
     </aside>
+    {mobileOpen && <button className="mobile-scrim" aria-label="Close navigation" onClick={() => setMobileOpen(false)} />}
     <main className="main-content">
-      <header className="topbar"><div><div className="breadcrumb">FLEETS / <b>DEMO FLEET</b></div><h1>Charging and battery overview</h1></div>
-        <div className="top-right"><span className="live-pill"><i /> LIVE</span><button className="logout" onClick={signOut}>Sign out</button><span className="avatar">OP</span></div>
-      </header>
-      {error && <div className="error-banner">{error}</div>}
-      <section className="metrics">
-        <Metric title="FLEET VEHICLES" value={summary?.total.toLocaleString() ?? '—'} detail={`${summary?.active.toLocaleString() ?? '—'} active`} icon="▣" />
-        <Metric title="REPORTING NOW" value={vehicles.length.toLocaleString()} detail="Vehicles with live telemetry" icon="⌁" />
-        <Metric title="CHARGE NOW" value={actionCounts.now.toLocaleString()} detail="Low charge or range" icon="↯" danger={actionCounts.now > 0} />
-        <Metric title="BATTERY SERVICE REVIEW" value={actionCounts.review.toLocaleString()} detail="Fault or high temperature hold" icon="!" danger={actionCounts.review > 0} />
-      </section>
-      <section className="history-strip">
-        <div><small>HISTORICAL TELEMETRY · LAST 24 HOURS</small><b>{analytics?.summary.events.toLocaleString() ?? '—'} events</b></div>
-        <div><small>VEHICLES IN WINDOW</small><b>{analytics?.summary.vehicle_count.toLocaleString() ?? '—'}</b></div>
-        <div><small>AVG ENERGY CONSUMPTION</small><b>{analytics?.summary.avg_consumption_kwh_per_100km?.toFixed(1) ?? '—'} <i>kWh / 100 km</i></b></div>
-        <span>On-demand historical aggregation</span>
-      </section>
-
-      <section className="panel charge-plan-panel" id="charging-plan">
-        <div className="panel-heading plan-heading"><div><h2>Fleet charging plan</h2><p>Urgency first; feasible charging options sorted by estimated energy bill</p></div>
-          <label className="target-control">Charge target <select value={targetSoc} onChange={(event) => setTargetSoc(Number(event.target.value))}><option value={70}>70% SoC</option><option value={80}>80% SoC</option><option value={90}>90% SoC</option></select></label>
-        </div>
-        <div className="plan-summary"><span className="plan-chip urgent">{actionCounts.now} charge now</span><span className="plan-chip soon">{actionCounts.soon} plan soon</span><span className="plan-chip review">{actionCounts.review} service review</span><span className="plan-chip charging-chip">{planTotals?.charging ?? chargePlan.filter((item) => item.charge_timing === 'charging').length} charging</span><span className="plan-live-count">Showing the top {Math.min(chargePlan.length, 100)} of {planReportingCount} indexed reporting vehicles{planTruncated ? ' · more available through the API' : ''}</span></div>
-        <div className="table-wrap plan-table-wrap"><table className="plan-table"><thead><tr><th>VEHICLE</th><th>WHEN</th><th>BATTERY</th><th>CHARGE / RANGE</th><th>LOWEST-COST STATION</th><th>ESTIMATED BILL</th></tr></thead>
-          <tbody>{chargePlan.slice(0, 100).map((item) => <tr key={item.vehicle_id} className="plan-row" onClick={() => setSelected(item)} tabIndex={0} onKeyDown={(event) => { if (event.key === 'Enter') setSelected(item); }}>
-            <td className="mono">{item.vehicle_id}</td><td><span className={`plan-status ${item.charge_timing}`}>{item.charge_timing_label}</span></td>
-            <td><b className={`health-category ${item.battery_health_category}`}>{item.battery_health_category}</b><small className="cell-sub">SoH {item.soh_pct.toFixed(1)}% · {item.battery_temp_c.toFixed(0)}°C</small></td>
-            <td><b>{item.soc_pct.toFixed(0)}% SoC</b><small className="cell-sub">{item.range_km.toFixed(0)} km remaining</small></td>
-            <td>{item.safety_hold ? <span className="cell-sub">Hold: inspect battery warning</span> : item.best_station ? <><b>{item.best_station.name}</b><small className="cell-sub">{item.best_station.distance_km.toFixed(1)} km · ₹{item.best_station.price_per_kwh_inr.toFixed(2)}/kWh</small></> : <span className="cell-sub">No reachable compatible station</span>}</td>
-            <td>{item.best_station ? <><b>₹{item.best_station.estimated_cost_inr.toFixed(2)}</b><small className="cell-sub">{item.best_station.estimated_charge_minutes} min to target</small></> : '—'}</td>
-          </tr>)}{chargePlan.length === 0 && <tr><td colSpan={6} className="empty">Waiting for vehicles to report telemetry.</td></tr>}</tbody>
-        </table></div>
-        <p className="plan-limitations">{planLimitations} Prices are current seeded flat rates; costs exclude traffic, route uncertainty, and station fees.</p>
-      </section>
-
-      <section className="content-grid"><div className="panel map-panel"><div className="panel-heading"><div><h2>Live vehicle map</h2><p>Current synthetic vehicle positions · Bengaluru</p></div><span className="count-tag">{vehicles.length} reporting</span></div>
-        <MapContainer center={[12.9716, 77.5946]} zoom={11} scrollWheelZoom className="fleet-map"><TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-          {vehicles.map((vehicle) => <CircleMarker key={vehicle.vehicle_id} center={[vehicle.latitude, vehicle.longitude]} radius={selected?.vehicle_id === vehicle.vehicle_id ? 9 : 6} pathOptions={{ color: vehicle.soc_pct <= 20 || vehicle.range_km <= 35 ? '#f05d5e' : '#24a47b', fillColor: vehicle.soc_pct <= 20 || vehicle.range_km <= 35 ? '#f05d5e' : '#24a47b', fillOpacity: .85 }} eventHandlers={{ click: () => setSelected(vehicle) }}>
-            <Popup><b>{vehicle.vehicle_id}</b><br />Charge {vehicle.soc_pct.toFixed(1)}% · {vehicle.range_km.toFixed(0)} km range<br />Battery {vehicle.battery_health_category}</Popup>
-          </CircleMarker>)}</MapContainer>
-      </div><div className="panel vehicle-panel" id="vehicles"><div className="panel-heading"><div><h2>Vehicles</h2><p>Select a vehicle for detailed health and range</p></div><span className="count-tag">{vehicles.length}</span></div>
-        <div className="vehicle-list">{vehicles.slice(0, 25).map((vehicle) => <button className={`vehicle-row ${selected?.vehicle_id === vehicle.vehicle_id ? 'chosen' : ''}`} key={vehicle.vehicle_id} onClick={() => setSelected(vehicle)}>
-          <span className={`vehicle-glyph ${vehicle.soc_pct <= 20 || vehicle.range_km <= 35 ? 'low' : ''}`}>EV</span><span className="vehicle-meta"><b>{vehicle.vehicle_id}</b><small>{vehicle.battery_health_category} · {vehicle.speed_kmh.toFixed(0)} km/h</small></span><span className="soc"><b>{vehicle.soc_pct.toFixed(0)}%</b><small>{vehicle.range_km.toFixed(0)} km</small></span>
-        </button>)}{vehicles.length === 0 && <div className="empty">Waiting for telemetry from the simulator…</div>}</div>
-      </div></section>
-
-      {selected && <section className="panel detail-panel"><div className="panel-heading"><div><h2>{selected.vehicle_id} · Vehicle health and charge options</h2><p>Updated from the latest synthetic telemetry and retained samples</p></div><button className="close-detail" onClick={() => setSelected(undefined)}>Clear selection</button></div>
-        <div className="detail-content"><div className="detail-stat"><small>BATTERY HEALTH</small><b className={`health-category ${batteryHealth?.category ?? selected.battery_health_category}`}>{batteryHealth?.category ?? selected.battery_health_category}</b><span>SoH {(batteryHealth?.soh_pct ?? selected.soh_pct).toFixed(1)}% · {(batteryHealth?.battery_temp_c ?? 0).toFixed(0)}°C</span><small>{batteryHealth?.reasons.join(', ') || 'No active health rule'}</small></div>
-          <div className="detail-stat"><small>ESTIMATED RANGE</small><b>{rangeEstimate?.estimated_range_km ?? '—'} km</b><span>{rangeEstimate?.method ?? 'Loading estimate'}</span><small>{rangeEstimate?.limitations}</small></div>
-          <div className="charging-options"><div className="options-heading"><b>Lowest-cost compatible stops</b><span>to {targetSoc}% SoC</span></div>{chargingOptions.slice(0, 3).map((option) => <div className="charger-row" key={option.station_code}>
-            <span><b>{option.name}</b><small>{option.distance_km.toFixed(1)} km · {option.estimated_charge_minutes} min · ₹{option.price_per_kwh_inr.toFixed(2)}/kWh</small></span><strong>₹{option.estimated_cost_inr.toFixed(2)}</strong>
-          </div>)}{chargingOptions.length === 0 && <small>No safe, reachable compatible charger is currently available.</small>}</div>
-        </div><div className="detail-note">{rangeEstimate?.limitations} {batteryHealth?.degradation_risk && `Battery risk: ${batteryHealth.degradation_risk}.`} Charging prices are flat seeded estimates.</div>
-      </section>}
-
-      <section className="service-grid"><section className="panel stations-panel" id="stations"><div className="panel-heading"><div><h2>Charging stations</h2><p>Active station connectors and seeded prices</p></div><span className="count-tag">{new Set(stations.map((station) => station.station_code)).size} stations</span></div>
-        <div className="station-list">{stations.slice(0, 8).map((station) => <article className="station-row" key={`${station.station_code}-${station.connector_type}`}><div><b>{station.name}</b><small>{station.station_code} · {station.connector_type} · {station.power_kw} kW</small></div><span>{station.available_ports} ports · ₹{station.price_per_kwh_inr.toFixed(2)}/kWh</span></article>)}{stations.length === 0 && <p className="empty">Loading station inventory…</p>}</div>
-      </section><section className="panel health-panel" id="system-health"><div className="panel-heading"><div><h2>System health</h2><p>Readiness checks · refreshes every five seconds</p></div><span className={`health-status ${systemHealth?.status ?? 'loading'}`}>{systemHealth?.status ?? 'loading'}</span></div>
-        <div className="health-list">{(['postgres', 'mongodb', 'redis'] as const).map((service) => <div className="health-row" key={service}><span>{service}</span><b className={systemHealth?.[service] ?? 'loading'}>{systemHealth?.[service] ?? 'checking'}</b></div>)}</div>
-      </section></section>
-
-      <section className="panel alerts-panel" id="alerts"><div className="panel-heading"><div><h2>Recent open alerts</h2><p>Battery and operational rule signals</p></div><a href="http://localhost:8000/docs" target="_blank" rel="noreferrer">API docs ↗</a></div>
-        <div className="table-wrap"><table><thead><tr><th>VEHICLE</th><th>ALERT</th><th>DETAIL</th><th>SEVERITY</th><th>CREATED</th></tr></thead><tbody>{alerts.slice(0, 8).map((alert) => <tr key={alert.id}><td className="mono">{alert.vehicle_id}</td><td>{alert.alert_type.replaceAll('_', ' ')}</td><td>{alert.message}</td><td><span className={`severity ${alert.severity}`}>{alert.severity}</span></td><td>{new Date(alert.created_at).toLocaleTimeString()}</td></tr>)}{alerts.length === 0 && <tr><td colSpan={5} className="empty">No open alerts</td></tr>}</tbody></table></div>
-      </section>
-      <footer>EV Fleet Intelligence <span>·</span> Independent synthetic-data prototype <span>·</span> Charging costs, battery health, and range are estimates</footer>
+      <header className="topbar"><button className="mobile-menu" aria-label="Open navigation" onClick={() => setMobileOpen(true)}><Menu size={19} /></button><div><div className="breadcrumb">FLEETS / <b>OPERATIONS</b></div></div><div className="top-right"><span className="live-pill"><i /> CONNECTED</span><button className="icon-button" aria-label="Sign out" title="Sign out" onClick={signOut}><LogOut size={16} /></button><span className="avatar">OP</span></div></header>
+      <Routes>
+        <Route path="/" element={<Navigate to="/charging-plan" replace />} />
+        <Route path="/charging-plan" element={<DashboardPage />} />
+        <Route path="/vehicles" element={<VehiclesPage />} />
+        <Route path="/vehicles/:vehicleId" element={<VehicleDetailsPage />} />
+        <Route path="/battery-health" element={<BatteryPage />} />
+        <Route path="/smart-charging" element={<SmartChargingPage />} />
+        <Route path="/stations" element={<StationsPage />} />
+        <Route path="/alerts" element={<AlertsPage />} />
+        <Route path="/analytics" element={<AnalyticsPage />} />
+        <Route path="/predictions" element={<PredictionsPage />} />
+        <Route path="/system-health" element={<SystemHealthPage />} />
+        <Route path="*" element={<NotFound />} />
+      </Routes>
+      <footer className="app-footer">EV Fleet Intelligence <span>·</span> Independent synthetic-data prototype <span>·</span> Estimates are informational</footer>
     </main>
   </div>;
 }
 
-function Metric({ title, value, detail, icon, danger = false }: { title: string; value: string; detail: string; icon: string; danger?: boolean }) {
-  return <article className="metric-card"><div className={`metric-icon ${danger ? 'danger' : ''}`}>{icon}</div><div className="metric-title">{title}</div><div className="metric-value">{value}</div><div className="metric-detail">{detail}</div></article>;
+function Login({ sessionExpired, onLogin }: { sessionExpired: boolean; onLogin: (token: string) => void }) {
+  const [error, setError] = useState('');
+  const submit = async (event: React.FormEvent<HTMLFormElement>) => { event.preventDefault(); setError(''); const form = new FormData(event.currentTarget);
+    try { const response = await apiRequest('/auth/token', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: form.get('email'), password: form.get('password') }) }, true); if (!response.ok) throw new Error(); const result = await response.json() as { access_token: string; token_type: string }; if (result.token_type.toLowerCase() !== 'bearer') throw new Error(); storeAccessToken(result.access_token); onLogin(result.access_token); }
+    catch { setError('Sign in failed. Check your credentials and API availability.'); }
+  };
+  return <div className="login-screen"><form className="login-card" onSubmit={submit}><div className="brand-icon">EF</div><p className="eyebrow">INDEPENDENT EV FLEET INTELLIGENCE</p><h1>Fleet operations, in focus</h1><p>Sign in to review live fleet telemetry, battery condition, and charging decisions.</p>{sessionExpired && <Notice tone="warning">Your session expired. Sign in again to continue.</Notice>}{error && <Notice tone="error">{error}</Notice>}<label>Email<input name="email" type="email" autoComplete="username" required /></label><label>Password<input name="password" type="password" autoComplete="current-password" required /></label><button className="primary-button full-width">Sign in <ChevronRight size={16} /></button><small>Use the operator credentials configured in your local environment.</small></form></div>;
 }
 
-createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);
+function PageHeader({ title, subtitle, icon: Icon, actions }: { title: string; subtitle: string; icon: React.ElementType; actions?: React.ReactNode }) { return <div className="page-header"><div className="page-title"><span className="page-icon"><Icon size={20} /></span><div><p className="eyebrow">FLEET OPERATIONS</p><h1>{title}</h1><p className="page-subtitle">{subtitle}</p></div></div>{actions && <div className="page-actions">{actions}</div>}</div>; }
+function Panel({ title, subtitle, children, className = '' }: { title: string; subtitle?: string; children: React.ReactNode; className?: string }) { return <section className={`panel ${className}`}><div className="panel-heading"><div><h2>{title}</h2>{subtitle && <p>{subtitle}</p>}</div></div>{children}</section>; }
+function Notice({ children, tone = 'info' }: { children: React.ReactNode; tone?: 'info' | 'warning' | 'error' }) { return <div className={`notice ${tone}`}>{children}</div>; }
+function Loading({ label = 'Loading live data…' }: { label?: string }) { return <div className="loading-state"><span className="spinner" />{label}</div>; }
+function DataState({ loading, error, children }: { loading: boolean; error: string; children: React.ReactNode }) { if (loading) return <Loading />; if (error) return <Notice tone="error">{error}</Notice>; return <>{children}</>; }
+function Metric({ title, value, note, icon: Icon, tone = 'green' }: { title: string; value: React.ReactNode; note: string; icon: React.ElementType; tone?: string }) { return <article className="metric-card"><div className={`metric-icon ${tone}`}><Icon size={18} /></div><div className="metric-title">{title}</div><div className="metric-value">{value}</div><div className="metric-detail">{note}</div></article>; }
+function formatTime(value?: string) { return value ? new Date(value).toLocaleString() : '—'; }
+function money(value?: number) { return value == null ? '—' : `₹${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}`; }
+function StatusBadge({ value }: { value?: string }) { const label = value?.replaceAll('_', ' ') ?? 'unknown'; return <span className={`status-badge ${value ?? 'unknown'}`}>{label}</span>; }
+
+function DashboardPage() {
+  const summary = useApi<Json>('/fleet/summary', 5000); const plan = useApi<Json>('/fleet/charging-plan?limit=100&target_soc_pct=80', 5000); const alerts = useApi<Json>('/alerts?limit=6&status=open', 5000); const stations = useApi<{ items: Station[] }>('/charging-stations?limit=50', 30000); const history = useApi<Json>('/analytics/consumption?period_hours=24&limit=5', 30000);
+  const points = (history.data?.highest_reporting_vehicles ?? []).map((item: Json) => ({ vehicle: item.vehicle_id, consumption: item.avg_consumption_kwh_per_100km }));
+  return <><PageHeader title="Charging plan" subtitle="Fleet priorities, live telemetry, and the lowest-cost reachable charging options." icon={LayoutDashboard} actions={<Link className="secondary-button" to="/vehicles">Explore vehicles <ChevronRight size={15} /></Link>} />
+    <ErrorStrip errors={[summary.error, plan.error, alerts.error, stations.error]} />
+    <section className="metrics"><Metric title="REGISTERED FLEET" value={summary.data?.total?.toLocaleString() ?? '—'} note={`${summary.data?.active?.toLocaleString() ?? '—'} active registry vehicles`} icon={CarFront} /><Metric title="REPORTING NOW" value={plan.data?.reporting_vehicle_count?.toLocaleString() ?? '—'} note="Vehicles with latest telemetry" icon={Activity} /><Metric title="CHARGE NOW" value={plan.data?.status_counts?.charge_now?.toLocaleString() ?? '—'} note="Current live priority index" icon={PlugZap} tone="amber" /><Metric title="OPEN ALERTS" value={summary.data?.open_alerts?.toLocaleString() ?? '—'} note={`${summary.data?.critical_alerts ?? 0} critical`} icon={AlertTriangle} tone="red" /></section>
+    <div className="dashboard-grid"><Panel title="Live fleet map" subtitle="Positions from the highest-priority reporting vehicles" className="map-panel"><Suspense fallback={<Loading label="Loading map…" />}><FleetMap items={plan.data?.items ?? []} /></Suspense></Panel>
+      <Panel title="Charging actions" subtitle="Urgency first, then estimated bill"><DataState loading={plan.loading} error={plan.error}><div className="compact-list">{(plan.data?.items ?? []).slice(0, 8).map((item: PlanItem) => <Link className="compact-row" to={`/vehicles/${encodeURIComponent(item.vehicle_id)}`} key={item.vehicle_id}><span className="row-icon"><PlugZap size={16} /></span><span className="row-main"><b>{item.vehicle_id}</b><small>{item.best_station?.name ?? (item.safety_hold ? 'Service inspection required' : 'No safe reachable station')}</small></span><span className="row-end"><StatusBadge value={item.charge_timing} />{item.best_station && <small>{money(item.best_station.estimated_cost_inr)}</small>}</span></Link>)}{!plan.data?.items?.length && <Empty text="No vehicles are reporting telemetry yet." />}</div></DataState><div className="panel-footer"><Link to="/smart-charging">Open smart charging <ChevronRight size={14} /></Link><span>{plan.data?.reporting_vehicle_count?.toLocaleString() ?? '—'} reporting · showing {plan.data?.count ?? 0}</span></div></Panel>
+    </div>
+    <div className="dashboard-grid secondary-grid"><Panel title="Fleet energy snapshot" subtitle="Observed telemetry, last 24 hours"><DataState loading={history.loading} error={history.error}><div className="snapshot-metrics"><div><small>TELEMETRY EVENTS</small><b>{history.data?.summary?.events?.toLocaleString() ?? '0'}</b></div><div><small>VEHICLES OBSERVED</small><b>{history.data?.summary?.vehicle_count?.toLocaleString() ?? '0'}</b></div><div><small>AVG CONSUMPTION</small><b>{history.data?.summary?.avg_consumption_kwh_per_100km?.toFixed(1) ?? '—'} <small>kWh/100 km</small></b></div></div><div className="chart-box short-chart"><Suspense fallback={<Loading label="Loading chart…" />}><ChartView variant="consumption" data={points} /></Suspense></div></DataState><div className="panel-footer"><Link to="/analytics">View analytics <ChevronRight size={14} /></Link><span>Observed averages · not a forecast</span></div></Panel>
+      <Panel title="Charging network" subtitle="Seeded station inventory"><div className="station-overview"><div className="station-count"><Building2 size={18} /><b>{new Set((stations.data?.items ?? []).map((s) => s.station_code)).size || '—'}</b><span>stations</span></div><div className="network-connectors">{Array.from(new Set((stations.data?.items ?? []).map((s) => s.connector_type))).map((type) => <span key={type}>{type}</span>)}</div><Notice tone="info">Live occupancy and queue are not reported by the station data source.</Notice></div><div className="panel-footer"><Link to="/stations">Browse stations <ChevronRight size={14} /></Link><span>{stations.data?.items.length ?? 0} connector records</span></div></Panel>
+    </div>
+  </>;
+}
+
+function VehiclesPage() {
+  const [searchParams, setSearchParams] = useSearchParams(); const page = Math.max(0, Number(searchParams.get('page') ?? 0)); const [search, setSearch] = useState(searchParams.get('search') ?? ''); const [batteryFilter, setBatteryFilter] = useState('all'); const [stateFilter, setStateFilter] = useState('all'); const [sortBy, setSortBy] = useState('vehicle_id'); const fleet = useApi<Json>('/battery-health/summary', 30000); const limit = 50;
+  useEffect(() => { const timer = window.setTimeout(() => { const next = new URLSearchParams(searchParams); next.set('page', '0'); if (search.trim()) next.set('search', search.trim()); else next.delete('search'); setSearchParams(next); }, 250); return () => window.clearTimeout(timer); }, [search]);
+  const path = `/vehicles?limit=${limit}&offset=${page * limit}&state=${stateFilter}&battery_health=${batteryFilter}&sort_by=${sortBy}${searchParams.get('search') ? `&search=${encodeURIComponent(searchParams.get('search')!)}` : ''}`;
+  const result = useApi<{ items: Vehicle[]; total: number; limit: number; offset: number }>(path);
+  const items = result.data?.items ?? [];
+  const pages = Math.ceil((result.data?.total ?? 0) / limit);
+  const changePage = (nextPage: number) => { const next = new URLSearchParams(searchParams); next.set('page', String(nextPage)); setSearchParams(next); };
+  const resetPage = () => { const next = new URLSearchParams(searchParams); next.set('page', '0'); setSearchParams(next); };
+  return <><PageHeader title="Vehicles" subtitle="Search the fleet registry and inspect current cached telemetry. Results are paginated by the API." icon={CarFront} actions={<span className="count-tag">{result.data?.total.toLocaleString() ?? '—'} registered</span>} />
+    <section className="metrics"><Metric title="REPORTING" value={fleet.data?.reporting?.toLocaleString() ?? '—'} note="Current latest state" icon={Activity} /><Metric title="CHARGING" value={fleet.data?.charging?.toLocaleString() ?? '—'} note="Charging in latest event" icon={PlugZap} /><Metric title="LOW BATTERY" value={fleet.data?.low_battery?.toLocaleString() ?? '—'} note="SoC ≤20% or range ≤35 km" icon={Battery} tone="amber" /><Metric title="CRITICAL / OFFLINE" value={`${fleet.data?.critical?.toLocaleString() ?? '—'} / ${fleet.data?.offline?.toLocaleString() ?? '—'}`} note="Battery rules / no retained state" icon={AlertTriangle} tone="red" /></section>
+    <Panel title="Fleet registry" subtitle="50 vehicles per server request"><div className="toolbar"><label className="search-box"><Search size={16} /><input placeholder="Search vehicle ID" value={search} onChange={(e) => setSearch(e.target.value)} /></label><label className="select-control">Fleet status <select value={stateFilter} onChange={(e) => { setStateFilter(e.target.value); resetPage(); }}><option value="all">All</option><option value="reporting">Reporting</option><option value="offline">Offline</option><option value="charging">Charging</option><option value="low_battery">Low battery</option><option value="critical">Critical battery</option></select></label><label className="select-control">Battery health <select value={batteryFilter} onChange={(e) => { setBatteryFilter(e.target.value); resetPage(); }}><option value="all">All</option><option value="healthy">Healthy</option><option value="watch">Watch</option><option value="critical">Critical</option></select></label><label className="select-control">Sort by <select value={sortBy} onChange={(e) => { setSortBy(e.target.value); resetPage(); }}><option value="vehicle_id">Vehicle ID</option><option value="soc">Lowest SoC</option><option value="range">Lowest range</option></select></label><span className="toolbar-note">State and health filters are applied server-side to live state.</span></div><DataState loading={result.loading || fleet.loading} error={result.error || fleet.error}><div className="table-wrap"><table><thead><tr><th>VEHICLE</th><th>MODEL</th><th>SOC</th><th>SOH</th><th>RANGE</th><th>SPEED</th><th>TEMP</th><th>LOCATION</th><th>CHARGING</th><th>LAST SEEN</th><th>BATTERY</th></tr></thead><tbody>{items.map((v) => <tr key={v.vehicle_id}><td><Link className="mono" to={`/vehicles/${encodeURIComponent(v.vehicle_id)}`}>{v.vehicle_id}</Link></td><td>{v.make} {v.model}</td><td>{v.latest ? `${v.latest.soc_pct}%` : '—'}</td><td>{v.latest ? `${v.latest.soh_pct}%` : '—'}</td><td>{v.latest ? `${v.latest.range_km} km` : '—'}</td><td>{v.latest ? `${v.latest.speed_kmh} km/h` : '—'}</td><td>{v.latest ? `${v.latest.battery_temp_c}°C` : '—'}</td><td>{v.latest ? `${v.latest.latitude.toFixed(3)}, ${v.latest.longitude.toFixed(3)}` : '—'}</td><td>{v.latest ? (v.latest.charging ? 'Charging' : 'Driving / idle') : 'Offline'}</td><td>{formatTime(v.latest?.timestamp)}</td><td><StatusBadge value={v.latest?.battery_health_category ?? 'offline'} /></td></tr>)}{items.length === 0 && <tr><td colSpan={11}><Empty text="No vehicles match these server-side filters." /></td></tr>}</tbody></table></div></DataState><Pagination page={page} pages={pages} onChange={changePage} total={result.data?.total ?? 0} limit={limit} /></Panel>
+  </>;
+}
+
+function Pagination({ page, pages, onChange, total, limit }: { page: number; pages: number; onChange: (page: number) => void; total: number; limit: number }) { return <div className="pagination"><span>{total ? `${page * limit + 1}–${Math.min((page + 1) * limit, total)} of ${total.toLocaleString()}` : 'No results'}</span><div><button disabled={page <= 0} onClick={() => onChange(Math.max(0, page - 1))}><ChevronLeft size={15} /> Previous</button><span>Page {pages ? page + 1 : 0} of {pages}</span><button disabled={page + 1 >= pages} onClick={() => onChange(Math.min(pages - 1, page + 1))}>Next <ChevronRight size={15} /></button></div></div>; }
+
+function VehicleDetailsPage() {
+  const { vehicleId = '' } = useParams(); const id = encodeURIComponent(vehicleId);
+  const vehicle = useApi<Json>(`/vehicles/${id}`); const range = useApi<Json>(`/vehicles/${id}/range-estimate`); const health = useApi<Json>(`/vehicles/${id}/battery-health`); const telemetry = useApi<Json>(`/vehicles/${id}/telemetry?period_hours=24&limit=500`); const charging = useApi<Json>(`/vehicles/${id}/charging-recommendations?target_soc_pct=80`); const alerts = useApi<Json>(`/alerts?limit=100&vehicle_id=${id}`);
+  const samples = telemetry.data?.items ?? [];
+  const sessions = samples.filter((sample: Json, index: number) => Boolean(sample.charging) && (index === 0 || !samples[index - 1].charging));
+  return <><PageHeader title={vehicleId} subtitle="Current vehicle state, recent telemetry, battery condition, and charging options." icon={CarFront} actions={<Link className="secondary-button" to="/vehicles">Back to vehicles</Link>} />
+    <ErrorStrip errors={[vehicle.error, range.error, health.error, telemetry.error, charging.error]} />
+    <DataState loading={vehicle.loading} error={vehicle.error}><><section className="metrics detail-metrics"><Metric title="STATE OF CHARGE" value={vehicle.data?.latest ? `${vehicle.data.latest.soc_pct}%` : 'No telemetry'} note="Latest simulator event" icon={Battery} tone="amber" /><Metric title="STATE OF HEALTH" value={vehicle.data?.latest ? `${vehicle.data.latest.soh_pct}%` : '—'} note={vehicle.data?.latest?.battery_health_category ?? 'Not reporting'} icon={HeartPulse} /><Metric title="ESTIMATED RANGE" value={range.data ? `${range.data.estimated_range_km} km` : '—'} note="Energy balance baseline" icon={Gauge} /><Metric title="TEMPERATURE" value={vehicle.data?.latest ? `${vehicle.data.latest.battery_temp_c}°C` : '—'} note={`Last seen ${formatTime(vehicle.data?.latest?.timestamp)}`} icon={Activity} /></section>
+      <Panel title="Telemetry history" subtitle="Retained MongoDB samples · last 24 hours"><DataState loading={telemetry.loading} error={telemetry.error}>{samples.length ? <div className="chart-box"><Suspense fallback={<Loading label="Loading chart…" />}><ChartView variant="vehicle" data={samples} /></Suspense></div> : <Empty text="No retained telemetry samples in this time window." />}</DataState></Panel>
+      <div className="dashboard-grid secondary-grid"><Panel title="Battery assessment" subtitle={health.data?.method ?? 'Current state'}><DataState loading={health.loading} error={health.error}><div className="assessment"><StatusBadge value={health.data?.category} /><b>{health.data?.degradation_risk ?? '—'} degradation risk</b><p>{health.data?.reasons?.length ? health.data.reasons.join(' · ') : 'No active battery health rules.'}</p><small>{health.data?.sample_count ?? 0} retained samples · {health.data?.charging_state_transitions_in_sample ?? 0} charging state transitions</small></div></DataState></Panel><Panel title="Reachable charging options" subtitle="Lowest estimated energy bill to target SoC"><DataState loading={charging.loading} error={charging.error}><OptionList items={charging.data?.items ?? []} empty="No safe, reachable compatible station is currently available." /></DataState></Panel></div>
+      <div className="dashboard-grid secondary-grid"><Panel title="Observed charging starts" subtitle="Transitions present in retained telemetry"><DataState loading={telemetry.loading} error={telemetry.error}>{sessions.length ? <div className="compact-list">{sessions.slice(-8).reverse().map((sample: Json) => <div className="compact-row" key={sample.timestamp}><span className="row-icon"><PlugZap size={16} /></span><span className="row-main"><b>Charging started</b><small>{formatTime(sample.timestamp)} · {sample.charging_power_kw ?? '—'} kW</small></span><b>{sample.soc_pct}% SoC</b></div>)}</div> : <Empty text="No charging-start transition in the retained sample window." />}</DataState></Panel><Panel title="Vehicle alerts" subtitle="Backend alert records for this vehicle"><DataState loading={alerts.loading} error={alerts.error}>{alerts.data?.items?.length ? <div className="compact-list">{alerts.data.items.slice(0, 8).map((a: Alert) => <div className="compact-row" key={a.id}><span className="row-icon"><AlertTriangle size={16} /></span><span className="row-main"><b>{a.alert_type.replaceAll('_', ' ')}</b><small>{formatTime(a.created_at)} · {a.message}</small></span><StatusBadge value={a.severity} /></div>)}</div> : <Empty text="No retained alert records for this vehicle." />}</DataState></Panel></div></></DataState>
+  </>;
+}
+
+function OptionList({ items, empty }: { items: Json[]; empty: string }) { return items.length ? <div className="compact-list">{items.slice(0, 8).map((item) => <div className="compact-row" key={item.station_code}><span className="row-icon"><PlugZap size={16} /></span><span className="row-main"><b>{item.name}</b><small>{item.distance_km} km · {item.estimated_charge_minutes} min · {item.connector_type}</small></span><b>{money(item.estimated_cost_inr)}</b></div>)}</div> : <Empty text={empty} />; }
+
+function BatteryPage() {
+  const summary = useApi<Json>('/battery-health/summary', 30000); const trend = useApi<Json>('/analytics/timeseries?period_hours=168', 30000); const [vehicleId, setVehicleId] = useState(''); const [query, setQuery] = useState(''); const [vehicle, setVehicle] = useState<Json>(); const [vehicleError, setVehicleError] = useState('');
+  const findVehicle = async (event: React.FormEvent) => { event.preventDefault(); setVehicle(undefined); setVehicleError(''); try { const response = await apiRequest(`/vehicles/${encodeURIComponent(query.trim())}/battery-health`); if (!response.ok) throw new Error('No live battery record found for that vehicle.'); setVehicle(await response.json()); setVehicleId(query.trim()); } catch (e) { setVehicleError(e instanceof Error ? e.message : 'Lookup failed'); } };
+  return <><PageHeader title="Battery health" subtitle="Fleet-wide SoH and temperature indicators calculated from current reporting telemetry." icon={HeartPulse} />{summary.error && <Notice tone="error">{summary.error}</Notice>}<DataState loading={summary.loading} error=""><section className="metrics"><Metric title="AVERAGE SOH" value={summary.data?.average_soh_pct != null ? `${summary.data.average_soh_pct}%` : '—'} note="Reporting vehicles only" icon={Battery} /><Metric title="HEALTHY" value={summary.data?.healthy?.toLocaleString() ?? '—'} note="SoH and temperature within rules" icon={ShieldCheck} /><Metric title="WATCH" value={summary.data?.watch?.toLocaleString() ?? '—'} note="Rule-based warning state" icon={Activity} tone="amber" /><Metric title="CRITICAL" value={summary.data?.critical?.toLocaleString() ?? '—'} note={`${summary.data?.temperature_risk ?? 0} temperature risks`} icon={AlertTriangle} tone="red" /></section><div className="dashboard-grid secondary-grid"><Panel title="Battery telemetry trend" subtitle="Hourly averages from retained telemetry; gaps are not interpolated"><DataState loading={trend.loading} error={trend.error}>{trend.data?.items?.length ? <TrendChart data={trend.data.items} /> : <Empty text="No hourly battery history is available yet." />}</DataState></Panel><Panel title="Vehicle battery history" subtitle="Look up a reporting vehicle"><form className="lookup-form" onSubmit={findVehicle}><label className="search-box"><Search size={15} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="EV-000123" required /></label><button className="primary-button">View battery</button></form>{vehicleError && <Notice tone="error">{vehicleError}</Notice>}{vehicle && <div className="assessment"><b>{vehicleId}</b><StatusBadge value={vehicle.category} /><p>SoH {vehicle.soh_pct}% · {vehicle.battery_temp_c}°C · {vehicle.degradation_risk} risk</p><small>{vehicle.sample_count} recent samples · {vehicle.observed_degradation_pct_points_per_day ?? 'Insufficient history'} percentage points/day observed change</small></div>}</Panel></div><Notice tone="info">{summary.data?.limitations ?? 'Current telemetry summary is loading.'}</Notice></DataState></>;
+}
+
+function SmartChargingPage() {
+  const [vehicleInput, setVehicleInput] = useState(''); const [vehicleId, setVehicleId] = useState(''); const [target, setTarget] = useState(80); const [recommendation, setRecommendation] = useState<Json>(); const [error, setError] = useState(''); const [loading, setLoading] = useState(false); const stations = useApi<{ items: Station[] }>('/charging-stations?limit=100');
+  useEffect(() => { if (!vehicleId) { setRecommendation(undefined); return; } let active = true; setLoading(true); setError(''); apiRequest(`/vehicles/${encodeURIComponent(vehicleId)}/charging-recommendations?target_soc_pct=${target}`).then(async (r) => { if (!r.ok) throw new Error((await r.json()).detail ?? `Request failed (${r.status})`); return r.json(); }).then((data) => { if (active) setRecommendation(data); }).catch((e) => { if (active) setError(e.message); }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, [vehicleId, target]);
+  return <><PageHeader title="Smart charging" subtitle="Compare compatible stations against current vehicle range, power, price, and target charge." icon={PlugZap} /><Panel title="Recommendation inputs" subtitle="The API verifies the vehicle and uses its latest telemetry and registry specification"><form className="toolbar" onSubmit={(e) => { e.preventDefault(); setVehicleId(vehicleInput.trim()); }}><label className="search-box"><Search size={15} /><input aria-label="Vehicle ID" placeholder="Enter vehicle ID" value={vehicleInput} onChange={(e) => setVehicleInput(e.target.value)} required /></label><button className="primary-button">Get recommendations</button><label className="select-control">Target SoC <select value={target} onChange={(e) => setTarget(Number(e.target.value))}><option value={70}>70%</option><option value={80}>80%</option><option value={90}>90%</option></select></label><Link className="secondary-button" to="/vehicles">Browse paginated registry</Link></form><DataState loading={loading} error={error}>{recommendation && <><div className="recommendation-context"><Metric title="CURRENT SOC" value={`${recommendation.current_soc_pct}%`} note={`${recommendation.current_range_km} km range`} icon={Battery} /><Metric title="CHARGE TIMING" value={<StatusBadge value={recommendation.charge_timing?.status} />} note={recommendation.charge_timing?.label ?? ''} icon={Clock3} /><Metric title="BATTERY" value={recommendation.battery_health_category} note={`Target ${target}%`} icon={HeartPulse} /></div><OptionList items={recommendation.items} empty="No safe reachable compatible charging option. Check the vehicle range, safety hold, or station connectors."/><p className="muted-note">{recommendation.limitations}</p></>}</DataState></Panel><Panel title="Network inventory" subtitle="Real seeded connector and tariff data"><DataState loading={stations.loading} error={stations.error}><StationsTable items={stations.data?.items ?? []} /></DataState></Panel></>;
+}
+
+function StationsTable({ items }: { items: Station[] }) { const [search, setSearch] = useState(''); const [connector, setConnector] = useState('all'); const [selected, setSelected] = useState<Station>(); const filtered = items.filter((s) => `${s.station_code} ${s.name}`.toLowerCase().includes(search.toLowerCase()) && (connector === 'all' || s.connector_type === connector)); return <><div className="toolbar"><label className="search-box"><Search size={15} /><input placeholder="Search stations" value={search} onChange={(e) => setSearch(e.target.value)} /></label><label className="select-control">Connector <select value={connector} onChange={(e) => setConnector(e.target.value)}><option value="all">All connectors</option>{Array.from(new Set(items.map((s) => s.connector_type))).map((c) => <option key={c}>{c}</option>)}</select></label></div><div className="table-wrap"><table><thead><tr><th>STATION</th><th>LOCATION</th><th>CONNECTOR</th><th>POWER</th><th>AVAILABLE PORTS</th><th>PRICE</th><th>OCCUPANCY / QUEUE</th><th>STATUS</th></tr></thead><tbody>{filtered.map((s) => <tr key={`${s.station_code}-${s.connector_type}`} className="selectable-row" tabIndex={0} onClick={() => setSelected(s)} onKeyDown={(e) => { if (e.key === 'Enter') setSelected(s); }}><td><b>{s.name}</b><small className="cell-sub">{s.station_code}</small></td><td>{s.latitude.toFixed(4)}, {s.longitude.toFixed(4)}</td><td>{s.connector_type}</td><td>{s.power_kw} kW</td><td>{s.available_ports}</td><td>{money(s.price_per_kwh_inr)}/kWh</td><td><span className="muted-note">Not reported</span></td><td><StatusBadge value="active" /></td></tr>)}{!filtered.length && <tr><td colSpan={8}><Empty text="No stations match." /></td></tr>}</tbody></table></div>{selected && <div className="station-detail"><b>{selected.name} · {selected.station_code}</b><span>{selected.connector_type} · {selected.power_kw} kW · {selected.available_ports} registered available ports</span><span>{selected.latitude.toFixed(5)}, {selected.longitude.toFixed(5)} · {money(selected.price_per_kwh_inr)}/kWh</span><small>Queue and occupied connector status are not included in the station feed.</small><a href={`https://www.openstreetmap.org/?mlat=${selected.latitude}&mlon=${selected.longitude}#map=15/${selected.latitude}/${selected.longitude}`} target="_blank" rel="noreferrer">View coordinates on OpenStreetMap</a></div>}<Notice tone="info">Station status is based on the seeded active registry. Occupied ports and live queues are not provided by the backend source.</Notice></>; }
+function StationsPage() { const stations = useApi<{ items: Station[] }>('/charging-stations?limit=500', 30000); return <><PageHeader title="Charging stations" subtitle="Browse the active connector and pricing registry." icon={Building2} /><Panel title="Station network" subtitle={`${stations.data?.items.length ?? '—'} connector records`}><DataState loading={stations.loading} error={stations.error}><StationsTable items={stations.data?.items ?? []} /></DataState></Panel></>; }
+
+function AlertsPage() { const [status, setStatus] = useState('open'); const [severity, setSeverity] = useState('all'); const result = useApi<{ items: Alert[] }>(`/alerts?limit=500&status=${status}`, 10000); const [actionError, setActionError] = useState(''); const act = async (alert: Alert, next: string) => { setActionError(''); try { const response = await apiRequest(`/alerts/${alert.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: next }) }); if (!response.ok) throw new Error(`Alert update failed (${response.status})`); result.reload(); } catch (e) { setActionError(e instanceof Error ? e.message : 'Alert update failed'); } }; const rows = (result.data?.items ?? []).filter((a) => severity === 'all' || a.severity === severity); return <><PageHeader title="Alerts" subtitle="Review and transition alerts generated by backend battery and telemetry rules." icon={Bell} /><Panel title="Alert management" subtitle="Acknowledging or resolving an alert updates the backend record"><div className="toolbar"><label className="select-control">Status <select value={status} onChange={(e) => setStatus(e.target.value)}>{['open', 'acknowledged', 'resolved'].map((v) => <option key={v}>{v}</option>)}</select></label><label className="select-control">Severity <select value={severity} onChange={(e) => setSeverity(e.target.value)}><option value="all">All severity</option>{['critical', 'high', 'warning', 'info'].map((v) => <option key={v}>{v}</option>)}</select></label></div>{actionError && <Notice tone="error">{actionError}</Notice>}<DataState loading={result.loading} error={result.error}><div className="table-wrap"><table><thead><tr><th>TIME</th><th>VEHICLE</th><th>TYPE</th><th>DETAIL</th><th>SEVERITY</th><th>STATUS</th><th>ACTION</th></tr></thead><tbody>{rows.map((a) => <tr key={a.id}><td>{formatTime(a.created_at)}</td><td><Link className="mono" to={`/vehicles/${a.vehicle_id}`}>{a.vehicle_id}</Link></td><td>{a.alert_type.replaceAll('_', ' ')}</td><td>{a.message}</td><td><StatusBadge value={a.severity} /></td><td><StatusBadge value={a.status} /></td><td>{a.status === 'open' && <button className="table-action" onClick={() => void act(a, 'acknowledged')}>Acknowledge</button>}{a.status === 'acknowledged' && <button className="table-action" onClick={() => void act(a, 'resolved')}>Resolve</button>}{a.status === 'resolved' && '—'}</td></tr>)}{!rows.length && <tr><td colSpan={7}><Empty text={`No ${status} alerts in the returned records.`} /></td></tr>}</tbody></table></div></DataState></Panel></>; }
+
+function AnalyticsPage() { const [hours, setHours] = useState(24); const timeseries = useApi<Json>(`/analytics/timeseries?period_hours=${hours}`, 30000); const consumption = useApi<Json>(`/analytics/consumption?period_hours=${hours}&limit=20`, 30000); return <><PageHeader title="Analytics" subtitle="Trends aggregated from retained simulator telemetry. Filters change the source time window." icon={ChartNoAxesCombined} actions={<label className="select-control">Window <select value={hours} onChange={(e) => setHours(Number(e.target.value))}><option value={24}>24 hours</option><option value={168}>7 days</option><option value={720}>30 days</option></select></label>} /><section className="metrics"><Metric title="EVENTS IN WINDOW" value={consumption.data?.summary?.events?.toLocaleString() ?? '—'} note={`Last ${hours} hours`} icon={Activity} /><Metric title="VEHICLES OBSERVED" value={consumption.data?.summary?.vehicle_count?.toLocaleString() ?? '—'} note="Vehicles with retained events" icon={CarFront} /><Metric title="AVERAGE CONSUMPTION" value={consumption.data?.summary?.avg_consumption_kwh_per_100km?.toFixed(1) ?? '—'} note="kWh per 100 km" icon={Gauge} /><Metric title="TIME BUCKETS" value={timeseries.data?.items?.length ?? '—'} note="Hours with telemetry" icon={Clock3} /></section><Panel title="Fleet telemetry trends" subtitle="Observed hourly averages; missing periods remain missing"><DataState loading={timeseries.loading} error={timeseries.error}>{timeseries.data?.items?.length ? <TrendChart data={timeseries.data.items} /> : <Empty text="No retained telemetry in this time window." />}</DataState></Panel><Panel title="Consumption by reporting vehicle" subtitle="Highest reporting vehicles returned by the MongoDB aggregation"><DataState loading={consumption.loading} error={consumption.error}>{consumption.data?.highest_reporting_vehicles?.length ? <div className="chart-box"><Suspense fallback={<Loading label="Loading chart…" />}><ChartView variant="consumption" data={consumption.data.highest_reporting_vehicles} /></Suspense></div> : <Empty text="No consumption data is available for this window." />}</DataState><Notice tone="info">Charging cost totals, station utilization, and fleet utilization are not captured in the current backend data model.</Notice></Panel></>; }
+function TrendChart({ data }: { data: Json[] }) { return <div className="chart-box"><Suspense fallback={<Loading label="Loading chart…" />}><ChartView variant="trend" data={data} /></Suspense></div>; }
+
+function PredictionsPage() { const [vehicleId, setVehicleId] = useState(''); const [vehicleInput, setVehicleInput] = useState(''); const [input, setInput] = useState<Json>(); const [result, setResult] = useState<Json>(); const [error, setError] = useState(''); const [loading, setLoading] = useState(false); const loadVehicle = async (event: React.FormEvent) => { event.preventDefault(); const id = vehicleInput.trim(); setVehicleId(id); setResult(undefined); setError(''); if (!id) { setInput(undefined); return; } try { const r = await apiRequest(`/vehicles/${encodeURIComponent(id)}`); if (!r.ok) throw new Error('Vehicle lookup failed'); const data = await r.json(); if (!data.latest) throw new Error('Selected vehicle has no live telemetry yet.'); setInput({ soc_pct: data.latest.soc_pct, soh_pct: data.latest.soh_pct, battery_temp_c: data.latest.battery_temp_c, energy_consumption_kwh_per_100km: data.latest.energy_consumption, speed_kmh: data.latest.speed_kmh, requested_trip_km: '', battery_capacity_kwh: data.vehicle.battery_capacity_kwh, onboard_charging_kw: data.vehicle.onboard_charging_kw, target_soc_pct: 80, fault_codes: data.latest.fault_codes ?? [] }); } catch (e) { setInput(undefined); setError(e instanceof Error ? e.message : 'Vehicle lookup failed'); } };
+  const predict = async (event: React.FormEvent) => { event.preventDefault(); if (!input) return; setLoading(true); setError(''); setResult(undefined); try { const response = await apiRequest('/predictions/range', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) throw new Error(data.detail ?? 'Prediction failed'); setResult(data); } catch (e) { setError(e instanceof Error ? e.message : 'Prediction failed'); } finally { setLoading(false); } };
+  return <><PageHeader title="Predictions" subtitle="Run an explainable range and charging estimate from current vehicle data or edited inputs." icon={Sparkles} /><Panel title="Prediction inputs" subtitle="Vehicle telemetry pre-fills measured inputs; enter any desired trip distance before predicting"><form className="toolbar" onSubmit={loadVehicle}><label className="search-box"><Search size={15} /><input aria-label="Vehicle ID" placeholder="Enter vehicle ID" value={vehicleInput} onChange={(e) => setVehicleInput(e.target.value)} required /></label><button className="secondary-button">Load vehicle telemetry</button><span className="toolbar-note">{vehicleId ? `Loaded ${vehicleId}` : 'Select from any fleet vehicle ID'}</span></form>{error && <Notice tone="error">{error}</Notice>}{input && <form className="prediction-form" onSubmit={predict}><div className="input-grid">{[['soc_pct','Current SoC %'],['soh_pct','Current SoH %'],['battery_temp_c','Battery temperature °C'],['energy_consumption_kwh_per_100km','Energy consumption kWh/100 km'],['speed_kmh','Current speed km/h'],['requested_trip_km','Requested distance km'],['battery_capacity_kwh','Battery capacity kWh'],['onboard_charging_kw','Onboard charge power kW'],['target_soc_pct','Target SoC %']].map(([key,label]) => <label key={key}>{label}<input type="number" min="0" step="any" value={input[key]} onChange={(e) => setInput({ ...input, [key]: e.target.value === '' ? '' : Number(e.target.value) })} required /></label>)}</div><button className="primary-button" disabled={loading}>{loading ? 'Calculating…' : 'Predict'} <Sparkles size={15} /></button></form>}</Panel>{result && <Panel title="Input → prediction → explanation" subtitle={`Method: ${result.method}`}><div className="prediction-results"><Metric title="REMAINING RANGE" value={`${result.prediction.estimated_remaining_range_km} km`} note={`${result.prediction.trip_with_10pct_reserve_feasible ? 'Trip fits with 10% reserve' : 'Trip exceeds reserved range'}`} icon={Gauge} /><Metric title="CHARGING ACTION" value={<StatusBadge value={result.prediction.charge_timing} />} note={result.prediction.charging_required_for_trip ? 'Charge required for requested trip' : 'Current range is sufficient'} icon={PlugZap} /><Metric title="TIME TO TARGET" value={`${result.prediction.estimated_charge_minutes_to_target} min`} note={`To ${result.prediction.target_soc_pct}% at onboard power`} icon={Clock3} /><Metric title="BATTERY RISK" value={result.prediction.battery_risk} note={result.prediction.safety_hold ? 'Safety hold indicated' : 'Rule assessment'} icon={HeartPulse} /></div><p className="muted-note">{result.explanation} {result.limitations}</p></Panel>}<Notice tone="info">This is a deterministic energy-balance baseline, not trained ML inference. Speed is captured as an input but excluded from the current range model.</Notice></>; }
+
+function SystemHealthPage() { const health = useApi<Json>('/system/health', 5000); const summary = useApi<Json>('/fleet/summary', 15000); const battery = useApi<Json>('/battery-health/summary', 30000); return <><PageHeader title="System health" subtitle="Readiness of connected data stores and fleet reporting coverage." icon={HeartPulse} /><DataState loading={health.loading} error={health.error}><section className="metrics"><Metric title="OVERALL STATUS" value={health.data?.status ?? '—'} note="API readiness response" icon={CircleGauge} /><Metric title="POSTGRESQL" value={health.data?.postgres ?? '—'} note="Registry, alerts, and users" icon={Building2} /><Metric title="MONGODB" value={health.data?.mongodb ?? '—'} note="Historical telemetry" icon={Activity} /><Metric title="REDIS" value={health.data?.redis ?? '—'} note="Latest state and charge priority" icon={Gauge} /></section><Panel title="Fleet data coverage" subtitle="Counts from registry and current telemetry cache"><DataState loading={summary.loading || battery.loading} error={summary.error || battery.error}><div className="health-coverage"><div><span>Registered vehicles</span><b>{summary.data?.total?.toLocaleString()}</b></div><div><span>Currently reporting</span><b>{battery.data?.reporting?.toLocaleString()}</b></div><div><span>Not reporting</span><b>{battery.data?.offline?.toLocaleString()}</b></div><div><span>Current telemetry source</span><b>Simulator → MQTT → Kafka</b></div></div><p className="muted-note">Last checked {new Date().toLocaleTimeString()} · Data freshness is determined by latest retained event; no independent simulator heartbeat endpoint is available.</p></DataState></Panel><Panel title="Connected service details" subtitle="Backend readiness checks"><div className="service-cards">{Object.entries(health.data ?? {}).filter(([key]) => key !== 'status').map(([name, status]) => <div className="service-card" key={name}><span className={`service-dot ${status}`} /><div><b>{name}</b><small>{String(status)}</small></div><StatusBadge value={String(status)} /></div>)}</div><a className="secondary-button inline-button" href="http://localhost:8000/docs" target="_blank" rel="noreferrer">Open API documentation <ChevronRight size={14} /></a></Panel></DataState></>; }
+
+function ErrorStrip({ errors }: { errors: string[] }) { const unique = [...new Set(errors.filter(Boolean))]; return unique.length ? <Notice tone="error">{unique.join(' · ')}</Notice> : null; }
+function Empty({ text }: { text: string }) { return <div className="empty-state"><ClipboardList size={20} /><span>{text}</span></div>; }
+function NotFound() { return <div className="not-found"><PageHeader title="Page not found" subtitle="The requested fleet workspace page does not exist." icon={AlertTriangle} /><Link to="/charging-plan" className="primary-button">Return to charging plan</Link></div>; }
+
+createRoot(document.getElementById('root')!).render(<React.StrictMode><BrowserRouter><App /></BrowserRouter></React.StrictMode>);
