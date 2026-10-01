@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ev-fleet.local/schemas/telemetry-v1.json",
+  "title": "EV Fleet Telemetry Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["vehicle_id", "timestamp", "latitude", "longitude", "speed_kmh", "soc_pct", "soh_pct", "battery_temp_c", "range_km", "energy_consumption", "odometer_km", "charging", "charging_power_kw", "sequence", "event_type", "event_id"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "vehicle_id": {"type": "string", "minLength": 3, "maxLength": 32, "pattern": "^[A-Z0-9_-]+$"},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "latitude": {"type": "number", "minimum": -90, "maximum": 90},
+    "longitude": {"type": "number", "minimum": -180, "maximum": 180},
+    "speed_kmh": {"type": "number", "minimum": 0, "maximum": 300},
+    "soc_pct": {"type": "number", "minimum": 0, "maximum": 100},
+    "soh_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 100},
+    "battery_temp_c": {"type": "number", "minimum": -40, "maximum": 120},
+    "range_km": {"type": "number", "minimum": 0, "maximum": 2000},
+    "energy_consumption": {"type": "number", "exclusiveMinimum": 0, "maximum": 200, "description": "kWh per 100 km"},
+    "odometer_km": {"type": "number", "minimum": 0},
+    "charging": {"type": "boolean"},
+    "charging_station_id": {"type": ["string", "null"], "maxLength": 48},
+    "charging_power_kw": {"type": "number", "minimum": 0, "maximum": 1000},
+    "fault_codes": {"type": "array", "maxItems": 8, "items": {"type": "string", "pattern": "^[PCBU][0-9A-F]{4}$"}},
+    "sequence": {"type": "integer", "minimum": 0},
+    "event_type": {"type": "string", "enum": ["TELEMETRY", "HEARTBEAT", "CHARGING_STARTED", "CHARGING_UPDATE", "CHARGING_STOPPED", "FAULT"]},
+    "event_id": {"type": "string", "format": "uuid"}
+  },
+  "allOf": [
+    {"if": {"required": ["charging"], "properties": {"charging": {"const": true}}}, "then": {"required": ["charging_station_id"], "properties": {"charging_station_id": {"type": "string", "minLength": 1}, "charging_power_kw": {"exclusiveMinimum": 0}}}},
+    {"if": {"required": ["charging"], "properties": {"charging": {"const": false}}}, "then": {"properties": {"charging_power_kw": {"const": 0}}}},
+    {"if": {"properties": {"event_type": {"const": "FAULT"}}}, "then": {"required": ["fault_codes"], "properties": {"fault_codes": {"minItems": 1}}}}
+  ]
+}
