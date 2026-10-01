@@ -1,6 +1,7 @@
 """Fleet API for health, live state, charging plans, stations, and alerts."""
 
 import logging
+from datetime import datetime, timezone
 from itertools import islice
 from uuid import UUID
 
@@ -17,7 +18,12 @@ from app.charging import charging_timing, recommend_stations
 from app.config import settings
 from app.db import SessionLocal, engine
 from app.models import User
-from app.repositories.redis_state import CHARGING_PLAN_KEY, initialize_charging_priority_index
+from app.repositories.redis_state import (
+    CHARGING_PLAN_KEY,
+    initialize_charging_priority_index,
+    initialize_latest_telemetry_index,
+    LATEST_TELEMETRY_KEY,
+)
 from app.repositories.redis_state import client as redis_client
 from app.security import issue_token, verify_password, verify_token
 
@@ -56,6 +62,8 @@ HTTP_LATENCY = Histogram("evfleet_api_request_seconds", "API request latency", [
 def warm_fleet_charging_index() -> None:
     indexed = initialize_charging_priority_index()
     logging.getLogger("evfleet.api").info("Fleet charge priority index ready vehicles=%s", indexed)
+    recent = initialize_latest_telemetry_index()
+    logging.getLogger("evfleet.api").info("Latest telemetry index ready vehicles=%s", recent)
 
 
 @app.middleware("http")
@@ -476,16 +484,29 @@ def vehicle_detail(vehicle_id: str) -> dict[str, object]:
 
 @app.get("/api/v1/live-vehicles", tags=["vehicles"])
 def live_vehicle_states(limit: int = Query(500, ge=1, le=2000)) -> dict[str, object]:
-    """Read the most recent cached state for seeded vehicles with telemetry."""
-    keys = list(redis_client.scan_iter(match="vehicle:latest:*", count=500))
-    states = []
+    """Return the most recently updated bounded sample of real cached vehicle states."""
+    vehicle_ids = redis_client.zrevrange(LATEST_TELEMETRY_KEY, 0, limit - 1)
+    keys = [f"vehicle:latest:{vehicle_id}" for vehicle_id in vehicle_ids]
     import json
-    for key in keys[:limit]:
-        payload = redis_client.hget(key, "payload")
-        if payload:
-            states.append(json.loads(payload))
+    if keys:
+        pipeline = redis_client.pipeline(transaction=False)
+        for key in keys:
+            pipeline.hget(key, "payload")
+        payloads = pipeline.execute()
+    else:
+        payloads = []
+    states = [json.loads(payload) for payload in payloads if payload]
     states.sort(key=lambda state: state.get("timestamp", ""), reverse=True)
-    return {"items": states, "count": len(states)}
+    reporting_count = int(redis_client.zcard(CHARGING_PLAN_KEY))
+    return {
+        "items": states,
+        "count": len(states),
+        "reporting_vehicle_count": reporting_count,
+        "sampled_limit": limit,
+        "truncated": reporting_count > len(states),
+        "as_of": datetime.now(timezone.utc).isoformat(),
+        "method": "bounded_most_recent_redis_latest_state_sample",
+    }
 
 
 @app.get("/api/v1/alerts", tags=["alerts"])

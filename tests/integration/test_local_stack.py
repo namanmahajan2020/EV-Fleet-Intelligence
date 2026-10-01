@@ -53,6 +53,7 @@ def test_mongodb_history_and_redis_latest_state() -> None:
     state = retry(lambda: redis.hget("vehicle:latest:EV-000001", "payload"), "Redis latest vehicle state")
     assert json.loads(state)["vehicle_id"] == "EV-000001"
     assert redis.zscore("fleet:charging:priority", "EV-000001") is not None
+    assert redis.zscore("fleet:telemetry:latest", "EV-000001") is not None
 
 
 def test_kafka_telemetry_topic_exists() -> None:
@@ -75,6 +76,26 @@ def test_authenticated_api_and_unauthenticated_rejection() -> None:
     request = Request(f"{API}/api/v1/fleet/summary", headers={"Authorization": f"Bearer {token}"})
     with urlopen(request, timeout=5) as response:
         assert json.load(response)["total"] == 100_000
+    request = Request(f"{API}/api/v1/live-vehicles?limit=1000", headers={"Authorization": f"Bearer {token}"})
+    with urlopen(request, timeout=10) as response:
+        live_map = json.load(response)
+        assert live_map["count"] == len(live_map["items"]) <= 1000
+        assert live_map["sampled_limit"] == 1000
+        assert live_map["reporting_vehicle_count"] >= live_map["count"]
+        assert live_map["method"] == "bounded_most_recent_redis_latest_state_sample"
+        timestamps = [item["timestamp"] for item in live_map["items"]]
+        assert timestamps == sorted(timestamps, reverse=True)
+        positions = live_map["items"]
+        quadrants = [sum(
+            (item["latitude"] >= 12.97) == north and (item["longitude"] >= 77.60) == east
+            for item in positions
+        ) for north, east in ((False, False), (False, True), (True, False), (True, True))]
+        assert all(150 < count < 350 for count in quadrants)
+        boundary_count = sum(
+            item["latitude"] in (12.77, 13.17) or item["longitude"] in (77.36, 77.84)
+            for item in positions
+        )
+        assert boundary_count < 100
     request = Request(f"{API}/api/v1/analytics/consumption?period_hours=24", headers={"Authorization": f"Bearer {token}"})
     with urlopen(request, timeout=30) as response:
         analytics = json.load(response)

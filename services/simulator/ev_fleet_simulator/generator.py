@@ -9,7 +9,8 @@ from uuid import NAMESPACE_URL, uuid5
 
 from event_schemas import EventType, TelemetryEvent
 
-CITY_CENTER = (12.9716, 77.5946)
+LATITUDE_BOUNDS = (12.77, 13.17)
+LONGITUDE_BOUNDS = (77.36, 77.84)
 STATIONS = (
     ("CHG-BLR-001", 12.9784, 77.6408, "CCS2", 60.0),
     ("CHG-BLR-002", 12.9756, 77.6068, "CCS2", 120.0),
@@ -29,6 +30,16 @@ STATIONS = (
 )
 MODELS = (("Voltara", "City", 48.0), ("Northstar", "Cargo", 76.0), ("Luma", "Touring", 82.0))
 FAULT_CODES = ("P0A80", "P0A0D", "P1A10", "U0100")
+
+
+def _reflect_into_bounds(value: float, delta: float, bounds: tuple[float, float]) -> float:
+    """Move by delta and reflect at the geofence instead of pinning at its edge."""
+    lower, upper = bounds
+    width = upper - lower
+    offset = (value - lower + delta) % (2 * width)
+    if offset > width:
+        offset = 2 * width - offset
+    return lower + offset
 
 
 @dataclass
@@ -87,6 +98,13 @@ class VehicleGenerator:
             for field in fields:
                 if field in payload:
                     setattr(state, field, payload[field])
+            # Older simulator versions clamped vehicles onto the exact geofence
+            # edges. Reinitialize only those synthetic edge artifacts with the
+            # same fleet-wide distribution used for new vehicles.
+            if state.latitude in LATITUDE_BOUNDS:
+                state.latitude = self.rng.uniform(*LATITUDE_BOUNDS)
+            if state.longitude in LONGITUDE_BOUNDS:
+                state.longitude = self.rng.uniform(*LONGITUDE_BOUNDS)
             restored += 1
         return restored
 
@@ -97,8 +115,8 @@ class VehicleGenerator:
         initial_soc = 18.0 if number == 1 else min(98.0, max(12.0, rng.gauss(61.0, 19.0)))
         return VehicleState(
             vehicle_id=f"EV-{number:06d}",
-            latitude=CITY_CENTER[0] + rng.uniform(-0.12, 0.12),
-            longitude=CITY_CENTER[1] + rng.uniform(-0.16, 0.16),
+            latitude=rng.uniform(*LATITUDE_BOUNDS),
+            longitude=rng.uniform(*LONGITUDE_BOUNDS),
             speed_kmh=0.0,
             soc_pct=round(initial_soc, 2),
             soh_pct=round(rng.uniform(86.0, 100.0), 2),
@@ -120,8 +138,8 @@ class VehicleGenerator:
         bearing = rng.uniform(-math.pi, math.pi)
         latitude_delta = distance_km * math.cos(bearing) / 111.0
         longitude_delta = distance_km * math.sin(bearing) / max(1.0, 111.0 * math.cos(math.radians(state.latitude)))
-        state.latitude = min(13.17, max(12.77, state.latitude + latitude_delta))
-        state.longitude = min(77.84, max(77.36, state.longitude + longitude_delta))
+        state.latitude = _reflect_into_bounds(state.latitude, latitude_delta, LATITUDE_BOUNDS)
+        state.longitude = _reflect_into_bounds(state.longitude, longitude_delta, LONGITUDE_BOUNDS)
         state.odometer_km += distance_km
         if state.charging:
             state.soc_pct = min(95.0, state.soc_pct + state.charging_power_kw * elapsed_hours / state.battery_capacity_kwh * 100)

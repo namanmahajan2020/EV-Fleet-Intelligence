@@ -2,7 +2,12 @@
 from datetime import datetime, timezone
 
 import pytest
-from ev_fleet_simulator.generator import VehicleGenerator
+from ev_fleet_simulator.generator import (
+    LATITUDE_BOUNDS,
+    LONGITUDE_BOUNDS,
+    VehicleGenerator,
+    _reflect_into_bounds,
+)
 from ev_fleet_simulator.runner import Config, build_wire_event
 from event_schemas import TelemetryEvent
 from pydantic import ValidationError
@@ -25,6 +30,34 @@ def test_vehicle_count_and_low_battery_demo_vehicle() -> None:
     assert generator.states[0].soc_pct == 18.0
 
 
+def test_initial_vehicle_distribution_covers_the_operating_region() -> None:
+    generator = VehicleGenerator(vehicle_count=1000, seed=44)
+    latitudes = [vehicle.latitude for vehicle in generator.states]
+    longitudes = [vehicle.longitude for vehicle in generator.states]
+    lat_midpoint = sum(LATITUDE_BOUNDS) / 2
+    lon_midpoint = sum(LONGITUDE_BOUNDS) / 2
+    quadrants = [0, 0, 0, 0]
+    for latitude, longitude in zip(latitudes, longitudes, strict=True):
+        quadrant = int(latitude >= lat_midpoint) * 2 + int(longitude >= lon_midpoint)
+        quadrants[quadrant] += 1
+    assert all(180 < count < 320 for count in quadrants)
+    assert min(latitudes) < LATITUDE_BOUNDS[0] + 0.005
+    assert max(latitudes) > LATITUDE_BOUNDS[1] - 0.005
+    assert min(longitudes) < LONGITUDE_BOUNDS[0] + 0.005
+    assert max(longitudes) > LONGITUDE_BOUNDS[1] - 0.005
+
+
+def test_vehicle_telemetry_moves_and_reflects_at_boundaries() -> None:
+    generator = VehicleGenerator(vehicle_count=1, seed=22, clock=fixed_time)
+    initial = (generator.states[0].latitude, generator.states[0].longitude)
+    event = generator.next_event(vehicle_index=0, interval_seconds=120)
+    assert (event["latitude"], event["longitude"]) != initial
+    assert LATITUDE_BOUNDS[0] <= event["latitude"] <= LATITUDE_BOUNDS[1]
+    assert LONGITUDE_BOUNDS[0] <= event["longitude"] <= LONGITUDE_BOUNDS[1]
+    assert LATITUDE_BOUNDS[0] < _reflect_into_bounds(LATITUDE_BOUNDS[0] + 0.001, -0.01, LATITUDE_BOUNDS) < LATITUDE_BOUNDS[0] + 0.01
+    assert LONGITUDE_BOUNDS[1] - 0.01 < _reflect_into_bounds(LONGITUDE_BOUNDS[1] - 0.001, 0.01, LONGITUDE_BOUNDS) < LONGITUDE_BOUNDS[1]
+
+
 def test_generator_restores_persisted_state_and_sequence_on_restart() -> None:
     generator = VehicleGenerator(vehicle_count=2, seed=1, clock=fixed_time)
     restored = generator.restore_states({"EV-000001": {
@@ -36,6 +69,19 @@ def test_generator_restores_persisted_state_and_sequence_on_restart() -> None:
     assert generator.states[0].soc_pct == 44.5
     assert generator.states[0].charging is True
     assert generator.states[1].sequence == 0
+
+
+def test_restore_resamples_legacy_clamped_edge_positions_without_dropping_vehicle() -> None:
+    generator = VehicleGenerator(vehicle_count=1, seed=17, clock=fixed_time)
+    restored = generator.restore_states({"EV-000001": {
+        "vehicle_id": "EV-000001", "sequence": 8,
+        "latitude": LATITUDE_BOUNDS[0], "longitude": LONGITUDE_BOUNDS[1],
+    }})
+    state = generator.states[0]
+    assert restored == 1
+    assert state.sequence == 8
+    assert LATITUDE_BOUNDS[0] < state.latitude < LATITUDE_BOUNDS[1]
+    assert LONGITUDE_BOUNDS[0] < state.longitude < LONGITUDE_BOUNDS[1]
 
 
 def test_generated_event_matches_canonical_contract_and_has_stable_id_for_sequence() -> None:
